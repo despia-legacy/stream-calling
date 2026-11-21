@@ -116,6 +116,13 @@ import Foundation
    StreamVideo.pausedUsers.remove("synthetic-failed");StreamVideo.connects.removeValue(forKey:"synthetic-failed")!.resume(throwing:StreamCallError.connectFailed);await attempt.value
    check("stale_connect_exception_keeps_new_session",stale && e.credentials?.userId=="synthetic-b" && StreamCallKeychain.saved?.userId=="synthetic-b")
   }
-  print("checks=18 failed=\(failed)");exit(failed==0 ? 0:1)
+  do {
+   let e=Engine();e.install("synthetic-a","a",url:nil);let provider=e.provider()
+   await e.logout();_ = try! await e.configure(StreamCallCredentials(userId:"synthetic-b",token:"b",tokenURL:nil))
+   var calls=0;var answer:String?="unexpected";let fetches=StreamCallTokenFetch.users.count
+   provider {calls+=1;answer=$0};await Task.yield()
+   check("obsolete_provider_entry_completes_without_work",calls==1 && answer==nil && e.requestIds.isEmpty && StreamCallTokenFetch.users.count==fetches && e.credentials?.userId=="synthetic-b")
+  }
+  print("checks=19 failed=\(failed)");exit(failed==0 ? 0:1)
  }
 }

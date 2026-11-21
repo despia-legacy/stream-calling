@@ -103,6 +103,13 @@ fun main() {
    StreamVideo.paused.remove("synthetic-failed");gate.completeExceptionally(CancellationException("owned synthetic deferred cancellation"));val code=configured.await()
    check("stale_connect_exception_keeps_new_session",code=="session_changed" && e.credentials?.userId=="synthetic-b" && StreamVideo.installed===e.client && StreamCallCredentials.saved?.userId=="synthetic-b")
   }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);val provider=e.provider()
+   val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};loggedOut.await()
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)};configured.await()
+   val token=provider()
+   check("obsolete_provider_entry_completes_without_work",token==null && !e.fetchStarted && e.requestIds.isEmpty() && e.credentials?.userId=="synthetic-b")
+  }
  }} finally {dispatcher.close()}
- println("checks=18 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
+ println("checks=19 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
 }

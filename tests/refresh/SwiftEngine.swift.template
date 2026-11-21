@@ -45,6 +45,10 @@ enum StreamCallError:Error {case notConfigured,storageFailed,busy,connectFailed,
   let c=StreamCallCredentials(userId:user,token:token,tokenURL:url)
   activeSession=TokenSession(c);credentials=c;_ = StreamCallKeychain.save(c);client=StreamVideo(user);_ = ledger.logout();_ = ledger.configure()
  }
+ func provider() -> (@escaping (String?) -> Void) -> Void {
+  let session=activeSession!
+  return { [weak self] reply in self?.refreshToken(session,reply) }
+ }
  func start(_ callback:@escaping(String?)->Void){refreshToken(activeSession!,callback)}
  func startCandidate(_ callback:@escaping(String?)->Void){refreshToken(candidateSession!,callback)}
 @METHODS@

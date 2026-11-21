@@ -48,6 +48,7 @@ class Engine(dispatcher:CoroutineDispatcher=Dispatchers.Unconfined) {
   val c=StreamCallCredentials(user,token,url);activeSession=TokenSession(c);credentials=c;StreamCallCredentials.save(host.dataDir(),c)
   client=StreamVideo(user);StreamVideo.installed=client;ledger.logout();ledger.configure()
  }
+ fun provider():suspend ()->String? {val session=activeSession!!;return {refreshToken(session)}}
  suspend fun start():String?=refreshToken(activeSession!!)
  suspend fun startCandidate():String?=refreshToken(candidateSession!!)
 @METHODS@
