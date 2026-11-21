@@ -28,14 +28,14 @@ class Engine(dispatcher:CoroutineDispatcher=Dispatchers.Unconfined) {
  var configuration=0L;var watchers=mutableListOf<Job>();var registeredDevice:Device?=null
  var cleanupGate:CompletableDeferred<Unit>?=null;var cleanupStarted=false
  val events=mutableListOf<Pair<String,JSONObject>>()
- var eventThread:String?=null
+ @Volatile var eventThread:String?=null
  private val NO_TOKEN=""
  val tokenWaiter:CompletableDeferred<String?>? get()=activeSession?.waiters?.values?.firstOrNull()
  val requestIds:List<String> get()=events.filter{it.first=="token_needed"}.map{it.second.getString("request_id")}
  @Volatile var fetchStarted=false
  var gate=CompletableDeferred<String?>()
  fun postForToken(url:String,user:String,token:String):String? {fetchStarted=true;return runBlocking{gate.await()}}
- fun emit(event:String,data:JSONObject){eventThread=Thread.currentThread().name;events.add(event to data)}
+ fun emit(event:String,data:JSONObject){events.add(event to data);eventThread=Thread.currentThread().name}
  fun endSdkCall(l:StreamCallLedger.Live){}
  fun endedFromSdk(l:StreamCallLedger.Live,reason:String){ledger.ended(l.cid,l.epoch,reason)}
  fun pushState()="pending"

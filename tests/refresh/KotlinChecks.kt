@@ -115,7 +115,7 @@ fun main() {
   }
   run {
    val e=Engine(dispatcher);e.install("synthetic-worker","a",null);val provider=e.nativeProvider()
-   val reply=async(Dispatchers.Default){provider.loadToken()};settle{e.requestIds.isNotEmpty()}
+   val reply=async(Dispatchers.Default){provider.loadToken()};settle{e.eventThread!=null}
    val owner=e.eventThread;e.setToken("worker-renewed",e.requestIds[0]);val token=reply.await()
    check("worker_sdk_provider_marshals_session_state_to_main",owner=="owned-refresh-checks" && token=="worker-renewed" && e.credentials?.token=="worker-renewed")
   }
