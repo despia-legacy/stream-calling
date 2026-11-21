@@ -18,7 +18,7 @@ Use the Despia SDK with React, Vue, Svelte, Next.js, TanStack or HTML5. Projects
 - `ios/` and `android/`: the Swift and Kotlin or Java sources and resources the manifest names.
 - `extensions.example.json`: the entry for `public/despia/extensions.json`.
 - `streamcall.policy.json`: the approval policy. It is a file you send to Despia with your approval request, together with the extension files. It is not served from your site and does not go into `public/despia/`.
-- `example/`: your own code. `example/src/lib/streamcall.js` is a page-side helper and `example/server/stream-token.example.js` is a token endpoint. They are not part of the native build.
+- `example/server/stream-token.example.js`: a token endpoint to adapt on your server. It is not part of the native build.
 
 ## Requirements
 
@@ -42,19 +42,23 @@ Install the SDK in your web app:
 npm install despia-native
 ```
 
-Copy `example/src/lib/despia-extension.js` to your app's `src/lib/` and adjust the import path if needed. It imports `despia` from `despia-native`, calls the SDK and returns the native answer's `data`. It checks native error envelopes and throws an error with their `code`. The SDK itself resolves native `ok: false` envelopes; it does not reject them. A single watched value becomes `undefined` after 30 seconds, which this helper reports as `sdk_timeout`.
+Call the published SDK directly and watch the exact answer variable declared in `manifest.json`. The SDK resolves to an object keyed by that variable; the native envelope is inside it. Check both a missing reply and `ok: false` before using `data`. Native errors resolve through the SDK; they do not reject its promise. A single watched variable becomes `undefined` after 30 seconds without a reply.
 
-Each helper call forwards a unique native callback into a separate watched value, so overlapping calls do not share response globals. `onExtensionEvent` registers the declared native event callbacks and returns a cleanup function. Events are callbacks, not values you can poll from the SDK proxy.
+Await calls that use the same answer variable sequentially. The SDK's command queue does not correlate concurrent responses. Encode every query value with `encodeURIComponent`, including JSON text. Spaces become `%20`; a literal plus becomes `%2B`. Do not use unmodified `URLSearchParams` form encoding, which uses plus for spaces.
 
-Importing the SDK is safe during server rendering. Run calls and event subscriptions only from browser click handlers or mounted client hooks. React and Vue can use the browser APIs used by this helper; in Next.js and other server-rendered apps, keep these calls in client code. The extension must be included in the installed Despia V3 app; a browser preview has no native extension features.
+Importing the SDK is safe during server rendering. Run native calls only in browser click handlers or mounted client hooks, including client components in Next.js. The extension must be included in the installed Despia V3 app; a browser preview has no native extension features. Optional event handlers use the declared callback on `globalThis`, not an SDK subscription API. Save and restore any callback your app already owns when a component mounts and unmounts.
 
 ## Calling it
 
 ```javascript
-import { extensionCall } from './lib/despia-extension.js';
+import despia from 'despia-native';
 
-const answer = await extensionCall('streamcall', 'status');
-console.log(answer);
+const answerReply = await despia('extension://streamcall/status', ['streamcallStatus']);
+const answer = answerReply.streamcallStatus;
+if (answer === undefined) throw new Error('No native reply within 30 seconds');
+if (!answer.ok) throw new Error(answer.code + ': ' + answer.error);
+
+console.log(answer.data);
 ```
 
 Calls use `extension://streamcall/<route>?<params>`. Each route answers once, in the page that made the call: the runtime sets the route's answer variable in the page, then calls the route's callback. Only declared parameters are accepted. Keep large data on the native side and pass identifiers through the bridge. A call URL is at most 8192 characters.
@@ -90,29 +94,33 @@ Before you build:
 
 - In `manifest.json`, in the `configure` route, replace `tokens.example.com` in `token_url.hosts` with the host of your token server.
 
-The two files in `example/` are yours. Copy both helpers from `example/src/lib/` into your web app's `src/lib/` and run `example/server/stream-token.example.js` on your own server. Despia never fetches or approves them. The Android dependencies must be the versions your app's base build already resolves. The build refuses others. This extension uses Stream Android 1.35.0 and push-firebase 1.3.4, which are on Maven Central. Newer versions are published only on Stream's own Maven repository, which this template does not add. You may use them by adding that repository in your own build. On iOS it uses StreamVideo 1.57.0, pinned in `ios/Package.resolved`.
+Adapt `example/server/stream-token.example.js` on your own server. Despia never fetches or approves that server file. The Android dependencies must be the versions your app's base build already resolves. The build refuses others. This extension uses Stream Android 1.35.0 and push-firebase 1.3.4, which are on Maven Central. Newer versions are published only on Stream's own Maven repository, which this template does not add. You may use them by adding that repository in your own build. On iOS it uses StreamVideo 1.57.0, pinned in `ios/Package.resolved`.
 
 ---
 
 ## Using it from your web app
 
 ```javascript
-import { configure, join, leave, setMuted, on, refreshTokensWith } from "./lib/streamcall.js";
+import despia from 'despia-native';
 
-const getToken = async () => (await fetch("/stream/token", { method: "POST" })).json();
-const { apiKey, userId, token } = await getToken();
-await configure({ apiKey, userId, token, tokenUrl: "https://tokens.example.com/stream/refresh" });
-refreshTokensWith(async () => (await getToken()).token);
+const credentials = await (await fetch('/stream/token', { method: 'POST' })).json();
 
-on("incoming", (c) => console.log("ringing", c.call_cid, c.caller_name)); // the system call screen rings too
-on("joined", (c) => console.log("in call", c.call_cid, c.audio_route));
-on("ended", (c) => console.log("ended", c.call_cid, c.reason));
+const configuredReply = await despia(`extension://streamcall/configure?api_key=${encodeURIComponent(credentials.apiKey)}&user_id=${encodeURIComponent(credentials.userId)}&token=${encodeURIComponent(credentials.token)}&token_url=${encodeURIComponent('https://tokens.example.com/stream/refresh')}`, ['streamcallConfigure']);
+const configured = configuredReply.streamcallConfigure;
+if (configured === undefined) throw new Error('No native reply within 30 seconds');
+if (!configured.ok) throw new Error(configured.code + ': ' + configured.error);
 
-await join({ callId: "support-42", ring: true, members: ["agent-7"] });
-// Later: setMuted(true); leave();
+globalThis.onStreamcallIncoming = call => console.log(call.call_cid, call.caller_name);
+globalThis.onStreamcallJoined = call => console.log(call.call_cid, call.audio_route);
+globalThis.onStreamcallEnded = call => console.log(call.call_cid, call.reason);
+
+const joinedReply = await despia(`extension://streamcall/join?call_type=${encodeURIComponent('audio_call')}&call_id=${encodeURIComponent('support-42')}&create=${encodeURIComponent(true)}&ring=${encodeURIComponent(true)}&members=${encodeURIComponent('agent-7')}`, ['streamcallJoin']);
+const joined = joinedReply.streamcallJoin;
+if (joined === undefined) throw new Error('No native reply within 30 seconds');
+if (!joined.ok) throw new Error(joined.code + ': ' + joined.error);
+
+console.log(joined.data);
 ```
-
-The helper in `example/src/lib/streamcall.js` gives one promise per route and one handler per event: `configure`, `setToken`, `logout`, `permissions`, `join`, `leave`, `setMuted`, `setSpeaker`, `status`, `on(event)` and `refreshTokensWith`. It rejects with an `Error` whose `code` is the answer's code.
 
 ### Credentials
 
@@ -128,7 +136,7 @@ When the token expires, the app first asks the `token_url` you configured (this 
 | `set_token`   | `token` (required)                                                                                      | An empty object | `streamcallSetToken` | `onStreamcallSetToken` |
 | `logout`      | none                                                                                                    | An empty object | `streamcallLogout` | `onStreamcallLogout` |
 | `permissions` | `request` (bool)                                                                                        | `microphone`, `notifications` | `streamcallPermissions` | `onStreamcallPermissions` |
-| `join`        | `call_type` (required, the helper defaults to `audio_call`), `call_id` (required), `create`, `ring`, `members` (comma-separated user ids; `ring` needs at least one) | `state: "connecting"` and the call | `streamcallJoin` | `onStreamcallJoin` |
+| `join`        | `call_type` (required, for example `audio_call`), `call_id` (required), `create`, `ring`, `members` (comma-separated user ids; `ring` needs at least one) | `state: "connecting"` and the call | `streamcallJoin` | `onStreamcallJoin` |
 | `leave`       | none                                                                                                    | `call_cid`, `state: "ended"` | `streamcallLeave` | `onStreamcallLeave` |
 | `set_muted`   | `muted` (bool, required)                                                                                | `muted`, `call_cid` | `streamcallSetMuted` | `onStreamcallSetMuted` |
 | `set_speaker` | `on` (bool, required)                                                                                   | The audio route | `streamcallSetSpeaker` | `onStreamcallSetSpeaker` |
