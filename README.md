@@ -110,9 +110,54 @@ const configured = configuredReply.streamcallConfigure;
 if (configured === undefined) throw new Error('No native reply within 30 seconds');
 if (!configured.ok) throw new Error(configured.code + ': ' + configured.error);
 
-globalThis.onStreamcallIncoming = call => console.log(call.call_cid, call.caller_name);
-globalThis.onStreamcallJoined = call => console.log(call.call_cid, call.audio_route);
-globalThis.onStreamcallEnded = call => console.log(call.call_cid, call.reason);
+const previousStreamcallIncoming = globalThis.onStreamcallIncoming;
+const handleStreamcallIncoming = call => {
+  try {
+    if (typeof previousStreamcallIncoming === 'function') previousStreamcallIncoming(call);
+  } finally {
+    console.log(call.call_cid, call.caller_name)
+  }
+};
+globalThis.onStreamcallIncoming = handleStreamcallIncoming;
+const cleanupStreamcallIncoming = () => {
+  if (globalThis.onStreamcallIncoming !== handleStreamcallIncoming) return;
+  if (previousStreamcallIncoming === undefined) delete globalThis.onStreamcallIncoming;
+  else globalThis.onStreamcallIncoming = previousStreamcallIncoming;
+};
+// Call cleanupStreamcallIncoming() when this component unmounts.
+
+const previousStreamcallJoined = globalThis.onStreamcallJoined;
+const handleStreamcallJoined = call => {
+  try {
+    if (typeof previousStreamcallJoined === 'function') previousStreamcallJoined(call);
+  } finally {
+    console.log(call.call_cid, call.audio_route)
+  }
+};
+globalThis.onStreamcallJoined = handleStreamcallJoined;
+const cleanupStreamcallJoined = () => {
+  if (globalThis.onStreamcallJoined !== handleStreamcallJoined) return;
+  if (previousStreamcallJoined === undefined) delete globalThis.onStreamcallJoined;
+  else globalThis.onStreamcallJoined = previousStreamcallJoined;
+};
+// Call cleanupStreamcallJoined() when this component unmounts.
+
+const previousStreamcallEnded = globalThis.onStreamcallEnded;
+const handleStreamcallEnded = call => {
+  try {
+    if (typeof previousStreamcallEnded === 'function') previousStreamcallEnded(call);
+  } finally {
+    console.log(call.call_cid, call.reason)
+  }
+};
+globalThis.onStreamcallEnded = handleStreamcallEnded;
+const cleanupStreamcallEnded = () => {
+  if (globalThis.onStreamcallEnded !== handleStreamcallEnded) return;
+  if (previousStreamcallEnded === undefined) delete globalThis.onStreamcallEnded;
+  else globalThis.onStreamcallEnded = previousStreamcallEnded;
+};
+// Call cleanupStreamcallEnded() when this component unmounts.
+
 
 const joinedReply = await despia(`extension://streamcall/join?call_type=${encodeURIComponent('audio_call')}&call_id=${encodeURIComponent('support-42')}&create=${encodeURIComponent(true)}&ring=${encodeURIComponent(true)}&members=${encodeURIComponent('agent-7')}`, ['streamcallJoin']);
 const joined = joinedReply.streamcallJoin;
