@@ -53,10 +53,15 @@ for platform, directory, engine, ledger, markers in platforms:
     extracted = '\n'.join(method(source, marker) for marker in markers)
     template = HERE / (platform + 'Engine.' + ('swift' if platform == 'Swift' else 'kt') + '.template')
     destination = output / template.stem
-    destination.write_text(template.read_text().replace('@METHODS@', extracted))
+    rendered = template.read_text().replace('@METHODS@', extracted)
+    if platform == 'Kotlin':
+        rendered = rendered.replace('@PROVIDER@', method(source, '                override suspend fun loadToken('))
+    destination.write_text(rendered)
     (output / ledger).write_bytes((directory / ledger).read_bytes())
     checks = HERE / (platform + 'Checks.' + ('swift' if platform == 'Swift' else 'kt'))
     (output / checks.name).write_bytes(checks.read_bytes())
+    if platform == 'Kotlin':
+        markers = markers + ['                override suspend fun loadToken(']
     receipt['methods'][engine] = {marker: hashlib.sha256(method(source, marker).encode()).hexdigest() for marker in markers}
     for path in [directory / engine, directory / ledger, template, checks, Path(__file__).resolve()]:
         receipt['inputs'][str(path.relative_to(REPO))] = hashlib.sha256(path.read_bytes()).hexdigest()

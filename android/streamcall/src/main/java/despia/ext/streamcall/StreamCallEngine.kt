@@ -132,7 +132,9 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
             tokenProvider = object : TokenProvider {
                 // Stream's contract (TokenProvider.loadToken, 1.35.0): "If the token cannot be loaded,
                 // returns an empty string and never throws an exception." NO_TOKEN is that value.
-                override suspend fun loadToken(): String = refreshToken(session) ?: NO_TOKEN
+                override suspend fun loadToken(): String {
+                    return withContext(Dispatchers.Main.immediate) { refreshToken(session) ?: NO_TOKEN }
+                }
             },
             notificationConfig = NotificationConfig(
                 pushDeviceGenerators = generators,

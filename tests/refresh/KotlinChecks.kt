@@ -1,8 +1,11 @@
 package despia.ext.streamcall
 import kotlinx.coroutines.*
+import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.test.resetMain
 @OptIn(DelicateCoroutinesApi::class,ExperimentalCoroutinesApi::class)
 fun main() {
  val dispatcher=newSingleThreadContext("owned-refresh-checks")
+ Dispatchers.setMain(dispatcher)
  var failed=0
  fun check(name:String,okay:Boolean) {println("${if(okay) "PASS" else "FAIL"} $name");if(!okay)failed++}
  try {runBlocking(dispatcher) {
@@ -110,6 +113,12 @@ fun main() {
    val token=provider()
    check("obsolete_provider_entry_completes_without_work",token==null && !e.fetchStarted && e.requestIds.isEmpty() && e.credentials?.userId=="synthetic-b")
   }
- }} finally {dispatcher.close()}
- println("checks=19 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-worker","a",null);val provider=e.nativeProvider()
+   val reply=async(Dispatchers.Default){provider.loadToken()};settle{e.requestIds.isNotEmpty()}
+   val owner=e.eventThread;e.setToken("worker-renewed",e.requestIds[0]);val token=reply.await()
+   check("worker_sdk_provider_marshals_session_state_to_main",owner=="owned-refresh-checks" && token=="worker-renewed" && e.credentials?.token=="worker-renewed")
+  }
+ }} finally {Dispatchers.resetMain();dispatcher.close()}
+ println("checks=20 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
 }
