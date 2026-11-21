@@ -1,0 +1,277 @@
+{
+  "version": "1.0.0",
+  "bridge": {
+    "routes": [
+      {
+        "name": "configure",
+        "timeout_ms": 20000,
+        "params": {
+          "api_key": {
+            "type": "string",
+            "max": 64,
+            "required": true
+          },
+          "user_id": {
+            "type": "string",
+            "max": 128,
+            "required": true
+          },
+          "user_name": {
+            "type": "string",
+            "max": 256
+          },
+          "token": {
+            "type": "string",
+            "max": 4096,
+            "required": true
+          },
+          "token_url": {
+            "type": "https_url",
+            "hosts": [
+              "tokens.example.com"
+            ]
+          },
+          "voip_provider": {
+            "type": "string",
+            "max": 64
+          },
+          "fcm_provider": {
+            "type": "string",
+            "max": 64
+          }
+        },
+        "output": {
+          "variable": "streamcallConfigure",
+          "callback": "onStreamcallConfigure"
+        }
+      },
+      {
+        "name": "set_token",
+        "timeout_ms": 5000,
+        "params": {
+          "token": {
+            "type": "string",
+            "max": 4096,
+            "required": true
+          }
+        },
+        "output": {
+          "variable": "streamcallSetToken",
+          "callback": "onStreamcallSetToken"
+        }
+      },
+      {
+        "name": "logout",
+        "timeout_ms": 10000,
+        "params": {},
+        "output": {
+          "variable": "streamcallLogout",
+          "callback": "onStreamcallLogout"
+        }
+      },
+      {
+        "name": "permissions",
+        "timeout_ms": 25000,
+        "params": {
+          "request": {
+            "type": "bool"
+          }
+        },
+        "output": {
+          "variable": "streamcallPermissions",
+          "callback": "onStreamcallPermissions"
+        }
+      },
+      {
+        "name": "join",
+        "timeout_ms": 5000,
+        "params": {
+          "call_type": {
+            "type": "string",
+            "max": 64,
+            "required": true
+          },
+          "call_id": {
+            "type": "string",
+            "max": 64,
+            "required": true
+          },
+          "create": {
+            "type": "bool"
+          },
+          "ring": {
+            "type": "bool"
+          },
+          "members": {
+            "type": "string",
+            "max": 4096
+          }
+        },
+        "output": {
+          "variable": "streamcallJoin",
+          "callback": "onStreamcallJoin"
+        }
+      },
+      {
+        "name": "leave",
+        "timeout_ms": 5000,
+        "params": {},
+        "output": {
+          "variable": "streamcallLeave",
+          "callback": "onStreamcallLeave"
+        }
+      },
+      {
+        "name": "set_muted",
+        "timeout_ms": 5000,
+        "params": {
+          "muted": {
+            "type": "bool",
+            "required": true
+          }
+        },
+        "output": {
+          "variable": "streamcallSetMuted",
+          "callback": "onStreamcallSetMuted"
+        }
+      },
+      {
+        "name": "set_speaker",
+        "timeout_ms": 5000,
+        "params": {
+          "on": {
+            "type": "bool",
+            "required": true
+          }
+        },
+        "output": {
+          "variable": "streamcallSetSpeaker",
+          "callback": "onStreamcallSetSpeaker"
+        }
+      },
+      {
+        "name": "status",
+        "params": {},
+        "output": {
+          "variable": "streamcallStatus",
+          "callback": "onStreamcallStatus"
+        }
+      }
+    ],
+    "events": [
+      {
+        "name": "incoming",
+        "callback": "onStreamcallIncoming",
+        "scope": "app"
+      },
+      {
+        "name": "connecting",
+        "callback": "onStreamcallConnecting",
+        "scope": "app"
+      },
+      {
+        "name": "joined",
+        "callback": "onStreamcallJoined",
+        "scope": "app"
+      },
+      {
+        "name": "ended",
+        "callback": "onStreamcallEnded",
+        "scope": "app"
+      },
+      {
+        "name": "muted",
+        "callback": "onStreamcallMuted",
+        "scope": "app"
+      },
+      {
+        "name": "audio_route",
+        "callback": "onStreamcallAudioRoute",
+        "scope": "app"
+      },
+      {
+        "name": "error",
+        "callback": "onStreamcallError",
+        "scope": "app"
+      },
+      {
+        "name": "token_needed",
+        "callback": "onStreamcallTokenNeeded",
+        "scope": "app"
+      }
+    ]
+  },
+  "ios": {
+    "packages": [
+      {
+        "name": "stream-video-swift",
+        "remote": {
+          "url": "https://github.com/GetStream/stream-video-swift",
+          "revision": "5fda355f0a682ebbf1e131d80d38386acd4c4406"
+        },
+        "products": [
+          "StreamVideo"
+        ]
+      }
+    ],
+    "package_resolved": "ios/Package.resolved",
+    "app": {
+      "entry_type": "StreamCallExtension",
+      "sources": [
+        "ios/app/StreamCallExtension.swift",
+        "ios/app/StreamCallEngine.swift",
+        "ios/app/StreamCallLedger.swift",
+        "ios/app/StreamCallRules.swift",
+        "ios/app/StreamCallCredentials.swift"
+      ],
+      "frameworks": [
+        "AVFAudio",
+        "CallKit",
+        "Security",
+        "UserNotifications"
+      ],
+      "packages": [
+        "StreamVideo"
+      ],
+      "requires": {
+        "usage_descriptions": [
+          "NSMicrophoneUsageDescription"
+        ]
+      },
+      "info_plist": {
+        "UIBackgroundModes": [
+          "audio"
+        ]
+      },
+      "claims": {
+        "voip": true
+      },
+      "lifecycle": [
+        "launch",
+        "voip_push",
+        "terminate"
+      ]
+    }
+  },
+  "android": {
+    "entry_class": "despia.ext.streamcall.StreamCallExtension",
+    "requires": {
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.BLUETOOTH_CONNECT"
+      ]
+    },
+    "lifecycle": [
+      "application_create",
+      "activity_lifecycle"
+    ],
+    "modules": [
+      {
+        "kind": "custom",
+        "name": "streamcall",
+        "dir": "android/streamcall",
+        "link": "implementation"
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="nx_streamcall_answer">Answer</string>
+    <string name="nx_streamcall_decline">Decline</string>
+    <string name="nx_streamcall_unknown">Unknown Caller</string>
+</resources>

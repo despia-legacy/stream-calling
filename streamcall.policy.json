@@ -1,0 +1,74 @@
+{
+  "allow_voip": true,
+  "manifest_merge_directives": true,
+  "restricted": [
+    "android.permission.USE_FULL_SCREEN_INTENT"
+  ],
+  "exposed_components": {
+    "android": [
+      {
+        "tag": "receiver",
+        "name": "androidx.core.telecom.internal.MuteStateReceiver",
+        "exported": true,
+        "enabled": null,
+        "permission": null,
+        "intent_filters": [
+          {
+            "tag": "intent-filter",
+            "attrs": {},
+            "children": [
+              {
+                "tag": "action",
+                "attrs": {
+                  "name": "android.media.action.MICROPHONE_MUTE_CHANGED"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "tag": "receiver",
+        "name": "despia.ext.streamcall.StreamPushReceiver",
+        "exported": true,
+        "enabled": null,
+        "permission": "com.google.android.c2dm.permission.SEND",
+        "intent_filters": [
+          {
+            "tag": "intent-filter",
+            "attrs": {},
+            "children": [
+              {
+                "tag": "action",
+                "attrs": {
+                  "name": "com.google.android.c2dm.intent.RECEIVE"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "tag": "service",
+        "name": "androidx.core.telecom.internal.JetpackConnectionService",
+        "exported": true,
+        "enabled": null,
+        "permission": "android.permission.BIND_TELECOM_CONNECTION_SERVICE",
+        "intent_filters": [
+          {
+            "tag": "intent-filter",
+            "attrs": {},
+            "children": [
+              {
+                "tag": "action",
+                "attrs": {
+                  "name": "android.telecom.ConnectionService"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

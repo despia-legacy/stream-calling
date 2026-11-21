@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Audio calls only. Stream's library manifest brings its call service, receivers, the Telecom
+     permission MANAGE_OWN_CALLS, USE_FULL_SCREEN_INTENT (restricted: named in the template's approval
+     request) and the phone-call and microphone foreground types. What an audio-only app does not use
+     is removed here, so the app's merged manifest (which Despia approves as built) holds no camera,
+     screen-share or livestream piece. CAMERA, FOREGROUND_SERVICE_MEDIA_PLAYBACK and RECORD_AUDIO stay: the base
+     app already declares them. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-feature android:name="android.hardware.camera" tools:node="remove" />
+    <uses-feature android:name="android.hardware.camera.autofocus" tools:node="remove" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" tools:node="remove" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" tools:node="remove" />
+
+    <application>
+        <!-- Stream's FCM messages only (sender "stream.video"); the base FirebaseMessagingService
+             still receives every message. Only Google Play services holds the SEND permission. -->
+        <receiver
+            android:name="despia.ext.streamcall.StreamPushReceiver"
+            android:exported="true"
+            android:permission="com.google.android.c2dm.permission.SEND">
+            <intent-filter>
+                <action android:name="com.google.android.c2dm.intent.RECEIVE" />
+            </intent-filter>
+        </receiver>
+
+        <activity
+            android:name="despia.ext.streamcall.CallIntentActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true"
+            android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+            <intent-filter>
+                <action android:name="io.getstream.video.android.action.INCOMING_CALL" />
+                <action android:name="io.getstream.video.android.action.ACCEPT_CALL" />
+                <action android:name="io.getstream.video.android.action.OUTGOING_CALL" />
+                <action android:name="io.getstream.video.android.action.ONGOING_CALL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name="io.getstream.video.android.core.notifications.internal.service.CallService"
+            android:foregroundServiceType="microphone|phoneCall|shortService"
+            tools:replace="android:foregroundServiceType" />
+        <service
+            android:name="io.getstream.video.android.core.screenshare.StreamScreenShareService"
+            tools:node="remove" />
+        <service
+            android:name="io.getstream.video.android.core.notifications.internal.service.LivestreamCallService"
+            tools:node="remove" />
+        <service
+            android:name="io.getstream.video.android.core.notifications.internal.service.LivestreamAudioCallService"
+            tools:node="remove" />
+        <service
+            android:name="io.getstream.video.android.core.notifications.internal.service.LivestreamViewerService"
+            tools:node="remove" />
+        <receiver
+            android:name="io.getstream.video.android.core.notifications.internal.receivers.StopScreenshareBroadcastReceiver"
+            tools:node="remove" />
+    </application>
+</manifest>
