@@ -33,7 +33,15 @@ final class StreamCallEngine {
     /// The PushKit token as Stream registers it; nil until PushKit gives one.
     private var voipToken: String?
     private var voipInvalidated = false
-    private var pendingTokenWaiters: [(String?) -> Void] = []
+    private final class TokenSession {
+        var credentials: StreamCallCredentials
+        var valid = true
+        var revision: UInt64 = 0
+        var waiters: [String: (String?) -> Void] = [:]
+        init(_ credentials: StreamCallCredentials) { self.credentials = credentials }
+    }
+    private var activeSession: TokenSession?
+    private var candidateSession: TokenSession?
     private var routeObserver: NSObjectProtocol?
 
     @Injected(\.callKitService) private var callKit
@@ -54,89 +62,154 @@ final class StreamCallEngine {
         }
         guard let stored = StreamCallKeychain.load() else { return }
         credentials = stored
-        attach(build(stored))
+        let session = TokenSession(stored)
+        activeSession = session
+        attach(build(session), session: session)
         _ = ledger.configure()
     }
 
-    private func build(_ c: StreamCallCredentials) -> StreamVideo {
-        StreamVideo(apiKey: c.apiKey,
+    private func build(_ session: TokenSession) -> StreamVideo {
+        let c = session.credentials
+        return StreamVideo(apiKey: c.apiKey,
                     user: User(id: c.userId, name: c.userName),
                     token: UserToken(rawValue: c.token),
                     pushNotificationsConfig: .make(pushProviderName: "ios-apn", voipProviderName: c.voipProvider),
                     tokenProvider: { [weak self] done in
                         Task { @MainActor in
                             guard let self else { return done(.failure(StreamCallError.notConfigured)) }
-                            self.refreshToken { token in
+                            self.refreshToken(session) { token in
                                 if let token { done(.success(UserToken(rawValue: token))) } else { done(.failure(StreamCallError.tokenExpired)) }
                             }
                         }
                     })
     }
 
-    private func attach(_ c: StreamVideo) {
+    private func attach(_ c: StreamVideo, session: TokenSession) {
         subscriptions.removeAll()
         client = c
         callKit.streamVideo = c
         c.eventPublisher()
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] event in MainActor.assumeIsolated { self?.handle(event) } }
+            .sink { [weak self] event in
+                MainActor.assumeIsolated {
+                    guard let self, self.activeSession === session else { return }
+                    self.handle(event)
+                }
+            }
             .store(in: &subscriptions)
         c.state.$activeCall
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] active in MainActor.assumeIsolated { self?.activeCallChanged(active) } }
+            .sink { [weak self] active in
+                MainActor.assumeIsolated {
+                    guard let self, self.activeSession === session else { return }
+                    self.activeCallChanged(active)
+                }
+            }
             .store(in: &subscriptions)
         callKit.eventPipeline
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] event in MainActor.assumeIsolated { self?.callKitEvent(event) } }
+            .sink { [weak self] event in
+                MainActor.assumeIsolated {
+                    guard let self, self.activeSession === session else { return }
+                    self.callKitEvent(event)
+                }
+            }
             .store(in: &subscriptions)
     }
 
     /// Stores the credentials and connects. Replies with the push state; throws a code.
     func configure(_ c: StreamCallCredentials) async throws -> String {
-        // A new client replaces the one carrying the live call, so nothing is reconfigured under a call.
         if ledger.live != nil { throw StreamCallError.busy }
         var next = c
         if credentials?.userId == c.userId { next.registeredVoipToken = credentials?.registeredVoipToken }
-        let fresh = build(next)
+        invalidate(candidateSession)
+        let session = TokenSession(next)
+        candidateSession = session
+        let fresh = build(session)
         do {
             try await fresh.connect()
         } catch {
+            if candidateSession === session { candidateSession = nil }
+            invalidate(session)
             await fresh.disconnect()
             throw StreamCallError.connectFailed
         }
-        // A call that rang while connecting keeps its client.
+        guard candidateSession === session, session.valid else {
+            await fresh.disconnect()
+            throw StreamCallError.sessionChanged
+        }
         if ledger.live != nil {
+            candidateSession = nil
+            invalidate(session)
             await fresh.disconnect()
             throw StreamCallError.busy
         }
-        // Nothing of the old user is removed until the new user is connected and stored: a failed
-        // save leaves the old client, its credentials and its VoIP device as they were.
-        let previous = credentials
-        guard StreamCallKeychain.save(next) else {
+        guard StreamCallKeychain.save(session.credentials) else {
+            candidateSession = nil
+            invalidate(session)
             await fresh.disconnect()
             throw StreamCallError.storageFailed
         }
-        if let old = client, old !== fresh {
-            if previous?.userId != next.userId, let registered = previous?.registeredVoipToken {
+        let previous = credentials
+        let old = client
+        invalidate(activeSession)
+        activeSession = session
+        candidateSession = nil
+        credentials = session.credentials
+        attach(fresh, session: session)
+        _ = ledger.configure()
+        if let old, old !== fresh {
+            if previous?.userId != session.credentials.userId, let registered = previous?.registeredVoipToken {
                 _ = try? await old.deleteDevice(id: registered)
             }
             await old.disconnect()
         }
-        credentials = next
-        attach(fresh)
-        _ = ledger.configure()
+        guard activeSession === session else { throw StreamCallError.sessionChanged }
         await registerVoipToken()
+        guard activeSession === session else { throw StreamCallError.sessionChanged }
         return pushState
     }
 
-    func setToken(_ token: String) throws {
-        guard var c = credentials else { throw StreamCallError.notConfigured }
-        c.token = token
-        guard StreamCallKeychain.save(c) else { throw StreamCallError.storageFailed }
-        credentials = c
-        let waiters = pendingTokenWaiters
-        pendingTokenWaiters = []
+    func setToken(_ token: String, requestId: String? = nil) throws {
+        let session: TokenSession
+        if let requestId {
+            guard let owner = [activeSession, candidateSession].compactMap({ $0 }).first(where: {
+                $0.valid && $0.waiters[requestId] != nil
+            }) else { throw StreamCallError.tokenRequestExpired }
+            session = owner
+        } else {
+            guard let active = activeSession, active.valid else { throw StreamCallError.notConfigured }
+            session = active
+        }
+        guard storeToken(token, session: session) else { throw StreamCallError.storageFailed }
+    }
+
+    private func invalidate(_ session: TokenSession?) {
+        guard let session else { return }
+        session.valid = false
+        let waiters = Array(session.waiters.values)
+        session.waiters.removeAll()
+        waiters.forEach { $0(nil) }
+    }
+
+    private func owns(_ session: TokenSession) -> Bool {
+        session.valid && (activeSession === session || candidateSession === session)
+    }
+
+    private func storeToken(_ token: String, session: TokenSession) -> Bool {
+        guard owns(session) else { return false }
+        var next = session.credentials
+        next.token = token
+        if activeSession === session {
+            guard StreamCallKeychain.save(next) else { return false }
+            credentials = next
+        }
+        session.credentials = next
+        session.revision += 1
+        let waiters = Array(session.waiters.values)
+        session.waiters.removeAll()
         waiters.forEach { $0(token) }
+        return true
     }
 
     func logout() async {
@@ -144,6 +217,10 @@ final class StreamCallEngine {
         if let l = live { endSDKCall(l) }
         _ = ledger.logout()
         if let l = live { emit("ended", ["call_cid": l.cid, "reason": "logout"]) }
+        invalidate(candidateSession)
+        invalidate(activeSession)
+        candidateSession = nil
+        activeSession = nil
         call = nil
         subscriptions.removeAll()
         let c = client
@@ -153,42 +230,41 @@ final class StreamCallEngine {
         credentials = nil
         StreamCallKeychain.delete()
         if let c {
-            // No further ring on this device: the VoIP device leaves Stream before the client goes.
             if let registered { _ = try? await c.deleteDevice(id: registered) }
             await c.disconnect()
         }
-        let waiters = pendingTokenWaiters
-        pendingTokenWaiters = []
-        waiters.forEach { $0(nil) }
     }
 
     /// Token refresh, in this order: the developer's `token_url` when one was configured (it works
     /// with no page loaded), then the page (`token_needed`, answered by `set_token`, 10 s), else the
     /// call ends with `token_expired`. The developer's server decides whether to issue a token.
-    private func refreshToken(_ reply: @escaping (String?) -> Void) {
-        // No token: the live call cannot go on. It ends for real (Stream leaves or rejects, which
-        // ends the CallKit call) before the page hears `ended` with `token_expired`.
-        let done: (String?) -> Void = { [weak self] token in
-            if token == nil, let self, let l = self.ledger.live {
-                self.endSDKCall(l)
-                self.endedFromSDK(l, reason: "token_expired")
+    private func refreshToken(_ session: TokenSession, _ reply: @escaping (String?) -> Void) {
+        guard owns(session) else { return reply(nil) }
+        let revision = session.revision
+        let live = ledger.live
+        let requestId = UUID().uuidString
+        var finished = false
+        let finish: (String?) -> Void = { [weak self] token in
+            guard !finished else { return }
+            finished = true
+            session.waiters.removeValue(forKey: requestId)
+            if token == nil, let self, session.valid, self.activeSession === session,
+               session.revision == revision, let live, self.ledger.live?.epoch == live.epoch {
+                self.endSDKCall(live)
+                self.endedFromSDK(live, reason: "token_expired")
             }
             reply(token)
         }
-        guard let c = credentials else { return done(nil) }
+        session.waiters[requestId] = finish
+        let c = session.credentials
         Task { @MainActor in
-            if let url = c.tokenURL, isApprovedTokenURL(url), let token = await StreamCallTokenFetch.post(url, userId: c.userId, expired: c.token) {
-                try? setToken(token)
-                return done(token)
+            if let url = c.tokenURL, isApprovedTokenURL(url),
+               let token = await StreamCallTokenFetch.post(url, userId: c.userId, expired: c.token) {
+                guard owns(session), session.waiters[requestId] != nil, session.revision == revision else { return }
+                if storeToken(token, session: session) { return }
             }
-            var finished = false
-            let finish: (String?) -> Void = { token in
-                guard !finished else { return }
-                finished = true
-                done(token)
-            }
-            pendingTokenWaiters.append(finish)
-            emit("token_needed", ["user_id": c.userId])
+            guard owns(session), session.waiters[requestId] != nil, session.revision == revision else { return }
+            emit("token_needed", ["user_id": c.userId, "request_id": requestId])
             try? await Task.sleep(nanoseconds: 10_000_000_000)
             finish(nil)
         }
@@ -209,23 +285,30 @@ final class StreamCallEngine {
     }
 
     private func registerVoipToken() async {
-        guard let c = client, var creds = credentials else { return }
-        let old = creds.registeredVoipToken
+        guard let c = client, let session = activeSession else { return }
+        let old = session.credentials.registeredVoipToken
         guard let token = voipToken else {
-            if voipInvalidated, let old { _ = try? await c.deleteDevice(id: old); creds.registeredVoipToken = nil }
-            if creds != credentials ?? creds, StreamCallKeychain.save(creds) { credentials = creds }
+            if voipInvalidated, let old {
+                _ = try? await c.deleteDevice(id: old)
+                guard activeSession === session, client === c else { return }
+                var next = session.credentials
+                next.registeredVoipToken = nil
+                if StreamCallKeychain.save(next) { session.credentials = next; credentials = next }
+            }
             return
         }
         guard token != old else { return }
-        do {
-            try await c.setVoipDevice(id: token)
-        } catch {
+        do { try await c.setVoipDevice(id: token) }
+        catch {
             log("VoIP device registration failed; it is retried at the next configure or token update")
             return
         }
+        guard activeSession === session, client === c else { return }
         if let old { _ = try? await c.deleteDevice(id: old) }
-        creds.registeredVoipToken = token
-        if StreamCallKeychain.save(creds) { credentials = creds }
+        guard activeSession === session, client === c else { return }
+        var next = session.credentials
+        next.registeredVoipToken = token
+        if StreamCallKeychain.save(next) { session.credentials = next; credentials = next }
     }
 
     /// Reports the push to CallKit through Stream's provider in this same main-queue turn, and runs
@@ -451,7 +534,7 @@ final class StreamCallEngine {
 }
 
 enum StreamCallError: Error {
-    case notConfigured, tokenExpired, busy, connectFailed, storageFailed, noCall, routeFailed
+    case notConfigured, tokenExpired, busy, connectFailed, storageFailed, noCall, routeFailed, sessionChanged, tokenRequestExpired
 
     var code: String {
         switch self {
@@ -462,6 +545,8 @@ enum StreamCallError: Error {
         case .storageFailed: return "storage_failed"
         case .noCall: return "no_call"
         case .routeFailed: return "route_failed"
+        case .sessionChanged: return "session_changed"
+        case .tokenRequestExpired: return "token_request_expired"
         }
     }
 }

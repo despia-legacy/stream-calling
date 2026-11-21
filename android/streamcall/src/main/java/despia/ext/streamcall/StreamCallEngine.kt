@@ -79,16 +79,26 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private var call: Call? = null
     private var watchers = mutableListOf<Job>()
     private var callWatchers = mutableListOf<Job>()
-    private var tokenWaiter: CompletableDeferred<String?>? = null
+    private class TokenSession(var credentials: StreamCallCredentials) {
+        var valid = true
+        var revision = 0L
+        val waiters = mutableMapOf<String, CompletableDeferred<String?>>()
+    }
+    private var activeSession: TokenSession? = null
+    private var candidateSession: TokenSession? = null
+    private var candidateClient: StreamVideo? = null
+    private var configuration = 0L
 
     /** Application.onCreate (also when FCM starts the process): rebuild the client from storage. */
     fun restore() {
         val stored = StreamCallCredentials.load(host.dataDir()) ?: return
         credentials = stored
-        val c = build(stored)
-        attach(c)
+        val session = TokenSession(stored)
+        activeSession = session
+        val c = build(session)
+        attach(c, session)
         ledger.configure()
-        scope.launch { registerPush(c, stored) }
+        scope.launch { registerPush(c, session) }
     }
 
     private fun hasFirebase(): Boolean = FirebaseApp.getApps(app).isNotEmpty()
@@ -103,7 +113,8 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     }
 
     /** connect: false when configure() connects itself and waits for the answer. */
-    private fun build(c: StreamCallCredentials, connect: Boolean = true): StreamVideo {
+    private fun build(session: TokenSession, connect: Boolean = true): StreamVideo {
+        val c = session.credentials
         StreamVideo.instanceOrNull()?.let { StreamVideo.removeClient() }
         val generators = if (hasFirebase()) {
             listOf(FirebasePushDeviceGenerator(providerName = c.fcmProvider, context = app))
@@ -119,7 +130,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
             tokenProvider = object : TokenProvider {
                 // Stream's contract (TokenProvider.loadToken, 1.35.0): "If the token cannot be loaded,
                 // returns an empty string and never throws an exception." NO_TOKEN is that value.
-                override suspend fun loadToken(): String = refreshToken() ?: NO_TOKEN
+                override suspend fun loadToken(): String = refreshToken(session) ?: NO_TOKEN
             },
             notificationConfig = NotificationConfig(
                 pushDeviceGenerators = generators,
@@ -133,45 +144,74 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         ).build()
     }
 
-    private fun attach(c: StreamVideo) {
+    private fun attach(c: StreamVideo, session: TokenSession) {
         watchers.forEach { it.cancel() }
         watchers = mutableListOf(
-            scope.launch { c.state.ringingCall.collect { ringing -> ringingChanged(ringing) } },
-            scope.launch { c.state.activeCall.collect { active -> activeChanged(active) } },
-            scope.launch { c.getDevice().collect { d -> registeredDevice = d } },
+            scope.launch { c.state.ringingCall.collect { ringing -> if (activeSession === session) ringingChanged(ringing) } },
+            scope.launch { c.state.activeCall.collect { active -> if (activeSession === session) activeChanged(active) } },
+            scope.launch { c.getDevice().collect { d -> if (activeSession === session) registeredDevice = d } },
             scope.launch { currentFcmToken() },
         )
         client = c
     }
 
     fun configure(c: StreamCallCredentials, reply: Reply) {
-        // A new client replaces the one carrying the live call, so nothing is reconfigured under a call.
         if (ledger.live() != null) return reply.done("busy", null)
+        val old = credentials ?: StreamCallCredentials.load(host.dataDir())
+        val oldDevice = registeredDevice
+        configuration += 1
+        val operation = configuration
+        invalidate(candidateSession)
+        invalidate(activeSession)
+        activeSession = null
+        credentials = null
+        watchers.forEach { it.cancel() }
+        watchers.clear()
+        client = null
+        ledger.logout()
+        val session = TokenSession(c)
+        candidateSession = session
         scope.launch {
-            val old = credentials
-            // Android holds one Stream client, so building the new one replaces the old one. Nothing of
-            // the old user is removed until the new user is connected and stored: on any failure the
-            // old client comes back with its push device untouched, and the old user keeps ringing.
-            val oldDevice = registeredDevice
-            val fresh = build(c, connect = false)
-            client = null
+            if (configuration != operation) return@launch reply.done("session_changed", null)
+            val fresh = build(session, connect = false)
+            candidateClient = fresh
             val connected = withTimeoutOrNull(15_000) { fresh.connectAsync().await() }
-            if (connected !is Result.Success || !StreamCallCredentials.save(host.dataDir(), c)) {
-                StreamVideo.removeClient()
-                old?.let { attach(build(it)) }
+            if (configuration != operation || candidateSession !== session) {
+                removeOwnedClient(fresh)
+                return@launch reply.done("session_changed", null)
+            }
+            val next = session.credentials
+            if (connected !is Result.Success || !StreamCallCredentials.save(host.dataDir(), next)) {
+                invalidate(session)
+                candidateSession = null
+                candidateClient = null
+                removeOwnedClient(fresh)
+                old?.let {
+                    val restored = TokenSession(it)
+                    activeSession = restored
+                    credentials = it
+                    attach(build(restored), restored)
+                    ledger.configure()
+                }
                 return@launch reply.done(if (connected !is Result.Success) "connect_failed" else "storage_failed", null)
             }
-            credentials = c
-            attach(fresh)
+            activeSession = session
+            candidateSession = null
+            candidateClient = null
+            credentials = next
+            attach(fresh, session)
             ledger.configure()
-            if (old != null && old.userId != c.userId && oldDevice != null) {
-                // Stream stores one push device per app and skips registering a device equal to it,
-                // so the old user's device goes first; then this device registers for the new user.
+            if (old != null && old.userId != next.userId && oldDevice != null) {
                 fresh.deleteDevice(oldDevice)
             }
-            registerPush(fresh, c)
-            reply.done(null, JSONObject().put("user_id", c.userId).put("push", pushState()))
+            if (activeSession === session) registerPush(fresh, session)
+            if (activeSession !== session) return@launch reply.done("session_changed", null)
+            reply.done(null, JSONObject().put("user_id", next.userId).put("push", pushState()))
         }
+    }
+
+    private fun removeOwnedClient(owned: StreamVideo?) {
+        if (owned != null && StreamVideo.instanceOrNull() === owned) StreamVideo.removeClient()
     }
 
     /** Stream's own record of the device it registered (its getDevice()), and this install's FCM token. */
@@ -201,19 +241,49 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     }
 
     /** Registers this install's FCM token with Stream for the configured user; Stream records the result. */
-    private suspend fun registerPush(cl: StreamVideo, c: StreamCallCredentials) {
+    private suspend fun registerPush(cl: StreamVideo, session: TokenSession) {
         val t = currentFcmToken() ?: return
-        val r = cl.createDevice(PushDevice(t, PushProvider.FIREBASE, c.fcmProvider))
-        if (r !is Result.Success) log("Push device registration failed; it is retried at the next configure")
+        if (activeSession !== session || client !== cl) return
+        val result = cl.createDevice(PushDevice(t, PushProvider.FIREBASE, session.credentials.fcmProvider))
+        if (result !is Result.Success) log("Push device registration failed; it is retried at the next configure")
     }
 
-    fun setToken(token: String): String? {
-        val c = credentials ?: return "not_configured"
-        val next = c.withToken(token)
-        if (!StreamCallCredentials.save(host.dataDir(), next)) return "storage_failed"
-        credentials = next
-        tokenWaiter?.complete(token)
-        return null
+    fun setToken(token: String, requestId: String? = null): String? {
+        val session = if (requestId != null) {
+            listOfNotNull(activeSession, candidateSession).firstOrNull {
+                it.valid && it.waiters.containsKey(requestId)
+            } ?: return "token_request_expired"
+        } else {
+            activeSession?.takeIf { it.valid } ?: return "not_configured"
+        }
+        return if (storeToken(token, session)) null else "storage_failed"
+    }
+
+    private fun owns(session: TokenSession): Boolean {
+        return session.valid && (activeSession === session || candidateSession === session)
+    }
+
+    private fun invalidate(session: TokenSession?) {
+        if (session == null) return
+        session.valid = false
+        val waiters = session.waiters.values.toList()
+        session.waiters.clear()
+        waiters.forEach { it.complete(null) }
+    }
+
+    private fun storeToken(token: String, session: TokenSession): Boolean {
+        if (!owns(session)) return false
+        val next = session.credentials.withToken(token)
+        if (activeSession === session) {
+            if (!StreamCallCredentials.save(host.dataDir(), next)) return false
+            credentials = next
+        }
+        session.credentials = next
+        session.revision += 1
+        val waiters = session.waiters.values.toList()
+        session.waiters.clear()
+        waiters.forEach { it.complete(token) }
+        return true
     }
 
     fun logout(reply: Reply) {
@@ -222,23 +292,33 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         ledger.logout()
         if (live != null) emit("ended", JSONObject().put("call_cid", live.cid).put("reason", "logout"))
         val c = credentials
+        val old = client
+        val pending = candidateClient
+        configuration += 1
+        invalidate(candidateSession)
+        invalidate(activeSession)
+        candidateSession = null
+        candidateClient = null
+        activeSession = null
         credentials = null
         StreamCallCredentials.delete(host.dataDir())
-        tokenWaiter?.complete(null)
+        watchers.forEach { it.cancel() }
+        watchers.clear()
+        unbind()
+        client = null
+        registeredDevice = null
+        // logOut clears local push cache, so it happens before a later configure can register.
+        old?.logOut()
+        removeOwnedClient(pending)
         scope.launch {
-            if (c != null) unregisterPush(c)
-            client?.logOut()
-            StreamVideo.removeClient()
-            watchers.forEach { it.cancel() }
-            client = null
-            call = null
+            if (c != null && old != null) unregisterPush(old, c)
+            removeOwnedClient(old)
             reply.done(null, JSONObject())
         }
     }
 
     /** No further ring on this device: the FCM device leaves Stream before the client goes. */
-    private suspend fun unregisterPush(c: StreamCallCredentials) {
-        val cl = client ?: return
+    private suspend fun unregisterPush(cl: StreamVideo, c: StreamCallCredentials) {
         if (!hasFirebase()) return
         val token = CompletableDeferred<String?>()
         FirebaseMessaging.getInstance().token.addOnCompleteListener { t ->
@@ -246,7 +326,6 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         }
         val id = withTimeoutOrNull(5_000) { token.await() } ?: return
         cl.deleteDevice(Device(id = id, pushProvider = PushProvider.FIREBASE.key, pushProviderName = c.fcmProvider))
-        registeredDevice = null
     }
 
     /**
@@ -254,26 +333,30 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
      * with no page loaded), then the page (token_needed, answered by set_token, 10 s); else the
      * SDK gets no token and the call ends (token_expired). The developer's server decides.
      */
-    private suspend fun refreshToken(): String? {
-        val c = credentials ?: return null
+    private suspend fun refreshToken(session: TokenSession): String? {
+        if (!owns(session)) return null
+        val revision = session.revision
+        val live = ledger.live()
+        val requestId = java.util.UUID.randomUUID().toString()
+        val waiter = CompletableDeferred<String?>()
+        session.waiters[requestId] = waiter
+        val c = session.credentials
         val url = c.tokenUrl
         if (url != null && host.isApprovedTokenUrl(url)) {
             val fetched = withContext(Dispatchers.IO) { postForToken(url, c.userId, c.token) }
-            if (fetched != null) {
-                setToken(fetched)
-                return fetched
+            if (owns(session) && session.waiters[requestId] === waiter && session.revision == revision && fetched != null) {
+                storeToken(fetched, session)
             }
         }
-        val waiter = CompletableDeferred<String?>()
-        tokenWaiter = waiter
-        emit("token_needed", JSONObject().put("user_id", c.userId))
+        if (!waiter.isCompleted && owns(session) && session.revision == revision) {
+            emit("token_needed", JSONObject().put("user_id", c.userId).put("request_id", requestId))
+        }
         val token = withTimeoutOrNull(10_000) { waiter.await() }
-        if (tokenWaiter === waiter) tokenWaiter = null
-        if (token == null) ledger.live()?.let { l ->
-            // No token: the call cannot go on. It ends for real (Stream leaves or rejects, which ends
-            // the Telecom call, the call service and the microphone) before the page hears it.
-            endSdkCall(l)
-            endedFromSdk(l, "token_expired")
+        if (session.waiters[requestId] === waiter) session.waiters.remove(requestId)
+        if (token == null && session.valid && activeSession === session && session.revision == revision &&
+            live != null && ledger.live()?.epoch == live.epoch) {
+            endSdkCall(live)
+            endedFromSdk(live, "token_expired")
         }
         return token
     }

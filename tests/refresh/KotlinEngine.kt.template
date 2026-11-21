@@ -1,0 +1,54 @@
+package despia.ext.streamcall
+import kotlinx.coroutines.*
+import org.json.JSONObject
+class StreamCallCredentials(val userId:String,val token:String,val tokenUrl:String?,val fcmProvider:String="fixture") {
+ fun withToken(t:String)=StreamCallCredentials(userId,t,tokenUrl,fcmProvider)
+ companion object {var saved:StreamCallCredentials?=null;var fail=false
+ fun save(dir:java.io.File,c:StreamCallCredentials):Boolean{if(fail)return false;saved=c;return true}
+ fun load(dir:java.io.File)=saved;fun delete(dir:java.io.File){saved=null}}
+}
+class Device
+sealed class Result {class Success:Result()}
+class StreamVideo(val user:String) {
+ companion object {var installed:StreamVideo?=null;val paused=mutableMapOf<String,CompletableDeferred<Result>>()
+ fun instanceOrNull()=installed;fun removeClient(){installed?.removed=true;installed=null}}
+ var removed=false
+ fun connectAsync()=paused[user] ?: CompletableDeferred<Result>(Result.Success())
+ suspend fun deleteDevice(d:Device){}
+ fun logOut(){}
+}
+class Host {fun dataDir()=java.io.File("unused");fun isApprovedTokenUrl(u:String)=true}
+class Engine(dispatcher:CoroutineDispatcher=Dispatchers.Unconfined) {
+ fun interface Reply {fun done(code:String?,data:JSONObject?)}
+ var credentials:StreamCallCredentials?=null;val ledger=StreamCallLedger();val host=Host()
+ val scope=CoroutineScope(SupervisorJob()+dispatcher)
+ private var activeSession:TokenSession?=null;private var candidateSession:TokenSession?=null
+ private var candidateClient:StreamVideo?=null;var client:StreamVideo?=null;var call:Int?=null
+ var configuration=0L;var watchers=mutableListOf<Job>();var registeredDevice:Device?=null
+ var cleanupGate:CompletableDeferred<Unit>?=null;var cleanupStarted=false
+ val events=mutableListOf<Pair<String,JSONObject>>()
+ val tokenWaiter:CompletableDeferred<String?>? get()=activeSession?.waiters?.values?.firstOrNull()
+ val requestIds:List<String> get()=events.filter{it.first=="token_needed"}.map{it.second.getString("request_id")}
+ @Volatile var fetchStarted=false
+ var gate=CompletableDeferred<String?>()
+ fun postForToken(url:String,user:String,token:String):String? {fetchStarted=true;return runBlocking{gate.await()}}
+ fun emit(event:String,data:JSONObject){events.add(event to data)}
+ fun endSdkCall(l:StreamCallLedger.Live){}
+ fun endedFromSdk(l:StreamCallLedger.Live,reason:String){ledger.ended(l.cid,l.epoch,reason)}
+ fun pushState()="pending"
+ fun unbind(){call=null}
+ private suspend fun registerPush(cl:StreamVideo,s:TokenSession){}
+ suspend fun unregisterPush(cl:StreamVideo,c:StreamCallCredentials){cleanupStarted=true;cleanupGate?.await()}
+ private fun build(s:TokenSession,connect:Boolean=true):StreamVideo {
+  StreamVideo.instanceOrNull()?.let{StreamVideo.removeClient()};return StreamVideo(s.credentials.userId).also{StreamVideo.installed=it}
+ }
+ private fun attach(c:StreamVideo,s:TokenSession){client=c}
+ fun install(user:String,token:String,url:String?="https://synthetic.invalid/token") {
+  invalidate(activeSession);invalidate(candidateSession);candidateSession=null
+  val c=StreamCallCredentials(user,token,url);activeSession=TokenSession(c);credentials=c;StreamCallCredentials.save(host.dataDir(),c)
+  client=StreamVideo(user);StreamVideo.installed=client;ledger.logout();ledger.configure()
+ }
+ suspend fun start():String?=refreshToken(activeSession!!)
+ suspend fun startCandidate():String?=refreshToken(candidateSession!!)
+@METHODS@
+}

@@ -1,6 +1,6 @@
 # Stream Calling
 
-Source preview for Despia V3. This snapshot requires the runtime update currently awaiting release and an approved extension-enabled native build. Uploading these files does not change an installed app.
+Source preview for Despia V3. The runtime update and automatic discovery rollout are awaiting release. Rebuild and install the native app to include these files; uploading them does not change an installed app.
 
 Audio calls through Stream Video, with native CallKit and Telecom integration.
 
@@ -17,12 +17,12 @@ Use the Despia SDK with React, Vue, Svelte, Next.js, TanStack or HTML5. Projects
 - `manifest.json`: the extension's routes, parameters, events and native files.
 - `ios/` and `android/`: the Swift and Kotlin or Java sources and resources the manifest names.
 - `extensions.example.json`: the entry for `public/despia/extensions.json`.
-- `streamcall.policy.json`: the approval policy. It is a file you send to Despia with your approval request, together with the extension files. It is not served from your site and does not go into `public/despia/`.
+- `streamcall.policy.json`: a record of the native capabilities used by this extension. Keep it with the source; it does not go into `public/despia/`.
 - `example/server/stream-token.example.js`: a token endpoint to adapt on your server. It is not part of the native build.
 
 ## Requirements
 
-- A Despia V3 app with V3 Extensions enabled, and a web app that serves static files from its own HTTPS origin.
+- A Despia V3 app and a web app that serves static files from its own HTTPS origin.
 - The `despia-native` JavaScript SDK (`npm install despia-native`).
 - A Stream Video account (API key and secret) and a server that issues user tokens (an example is in `example/`).
 - An Apple Developer account for the VoIP push configuration, and a Firebase project for Android push.
@@ -32,7 +32,7 @@ Use the Despia SDK with React, Vue, Svelte, Next.js, TanStack or HTML5. Projects
 1. Copy `manifest.json`, `ios/` and `android/` into `public/despia/streamcall/` in your web app. The folder name is the extension id, so pages call `extension://streamcall/<route>`. Keep every path inside the folder unchanged, because the manifest names them. (`public/` is the folder your site serves from its root; in SvelteKit, use `static/`.)
 2. Add `"streamcall"` to the `extensions` list in `public/despia/extensions.json`. `extensions.example.json` shows the entry. Despia takes app identity from the build configuration.
 3. Set the values listed under "Values to set before you build". Vendor keys and hosts in this repository are placeholders only. Never put a server secret in the manifest or anywhere in your web app.
-4. Request approval and a new native build in Despia, and send `streamcall.policy.json` with the request. Despia reviews and approves these exact files before a build includes them, and any change to the manifest or to a native file needs a new approval and a new native build. It cannot be applied over the air.
+4. Rebuild and install your Despia V3 app once the runtime update and automatic discovery rollout are released. Signed build verification binds source hashes, dependency pins, app identity and final artifacts. It is separate from human code review. Changes to native files or the manifest require another native build.
 
 ## JavaScript SDK
 
@@ -171,14 +171,14 @@ console.log(joined.data);
 
 Nothing is built into the app. `configure` takes the API key, the user and a token from your page, which got them from your server. They are stored on the device (the Keychain on iOS, the extension's private storage on Android), so a push can ring with no page loaded. `logout` ends a live call, removes the push device from Stream, and deletes them. The token never appears in a reply, an event or a log line.
 
-When the token expires, the app first asks the `token_url` you configured (this works with no page loaded). Without one it sends `token_needed` and waits 10 seconds for `set_token`. If no token comes, the call ends with the reason `token_expired`. The example server renews a token only within 7 days after it expired.
+When the token expires, the app first asks the `token_url` you configured (this works with no page loaded). If that endpoint is absent or cannot renew the token, it sends `token_needed` with `user_id` and `request_id`, then waits 10 seconds for `set_token`. Pass the event's `request_id` back with your new token so a late response cannot update another login. Omitting `request_id` updates only the currently active session. Expired or unknown IDs return `token_request_expired`. If no token comes, the call ends with the reason `token_expired`. The example server renews a token only within 7 days after it expired.
 
 ### Routes
 
 | Route         | Parameters                                                                                              | Answer `data` | Answer variable | Callback |
 | ------------- | ------------------------------------------------------------------------------------------------------- | ------------- | --- | --- |
 | `configure`   | `api_key`, `user_id`, `token` (required), `user_name`, `token_url` (https, an approved host), `voip_provider`, `fcm_provider` | `user_id`, `push` (the push registration state) | `streamcallConfigure` | `onStreamcallConfigure` |
-| `set_token`   | `token` (required)                                                                                      | An empty object | `streamcallSetToken` | `onStreamcallSetToken` |
+| `set_token`   | `token` (required), `request_id` (from `token_needed`, recommended)                                                                                      | An empty object | `streamcallSetToken` | `onStreamcallSetToken` |
 | `logout`      | none                                                                                                    | An empty object | `streamcallLogout` | `onStreamcallLogout` |
 | `permissions` | `request` (bool)                                                                                        | `microphone`, `notifications` | `streamcallPermissions` | `onStreamcallPermissions` |
 | `join`        | `call_type` (required, for example `audio_call`), `call_id` (required), `create`, `ring`, `members` (comma-separated user ids; `ring` needs at least one) | `state: "connecting"` and the call | `streamcallJoin` | `onStreamcallJoin` |
@@ -206,7 +206,7 @@ Every event carries `call_cid` and a growing `seq`.
 
 ### Error codes
 
-Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a join while the recorder sample records), `permission_denied`, `connect_failed`, `storage_failed`, `bad_token` and, for a failed audio route change, `route_failed`.
+Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a join while the recorder sample records), `permission_denied`, `connect_failed`, `storage_failed`, `bad_token`, `token_request_expired` (a refresh request is no longer pending), `session_changed` (configure was superseded by logout or another configure) and, for a failed audio route change, `route_failed`.
 
 ---
 
@@ -225,7 +225,7 @@ Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a
 - **Push.** Your app keeps its one Firebase messaging service. `StreamPushReceiver` hands only Stream's messages to Stream.
 - **Call screen.** `CallIntentActivity`, opened by Stream's call notification, with Answer and Decline on the Lock Screen.
 - **Removed pieces.** The module manifest removes Stream's camera, screen-share and livestream pieces.
-- **Exported components.** The push receiver, and Android Telecom's connection service and mute receiver, listed in the approval policy exactly as the build shows them.
+- **Exported components.** The push receiver, and Android Telecom's connection service and mute receiver, recorded in the capability policy and verified against the built artifact.
 
 ---
 

@@ -107,7 +107,7 @@ final class StreamCallExtension: NativeExtension, NativeExtVoIPHandler {
             return .error(code: "bad_token", message: "token is required")
         }
         do {
-            try engine.setToken(token)
+            try engine.setToken(token, requestId: call.params["request_id"] as? String)
             return .ok([:])
         } catch let e as StreamCallError {
             return .error(code: e.code, message: "the token was not stored")

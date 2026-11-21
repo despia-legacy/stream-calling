@@ -53,6 +53,10 @@
             "type": "string",
             "max": 4096,
             "required": true
+          },
+          "request_id": {
+            "type": "string",
+            "max": 128
           }
         },
         "output": {

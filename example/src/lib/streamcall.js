@@ -28,7 +28,7 @@ export function on(event, listener) {
 export const configure = ({ apiKey, userId, userName, token, tokenUrl, voipProvider, fcmProvider }) =>
   call('configure', { api_key: apiKey, user_id: userId, user_name: userName, token, token_url: tokenUrl,
     voip_provider: voipProvider, fcm_provider: fcmProvider });
-export const setToken = token => call('set_token', { token });
+export const setToken = (token, requestId) => call('set_token', { token, request_id: requestId });
 export const logout = () => call('logout');
 export const permissions = (request = false) => call('permissions', { request });
 export const join = ({ callType = 'audio_call', callId, create = true, ring = false, members = [] }) =>
@@ -40,8 +40,8 @@ export const status = () => call('status');
 
 // Without token_url, native code waits 10 seconds after token_needed before ending the call.
 export function refreshTokensWith(fetchToken) {
-  return on('token_needed', async ({ user_id }) => {
-    try { await setToken(await fetchToken(user_id)); }
+  return on('token_needed', async ({ user_id, request_id }) => {
+    try { await setToken(await fetchToken(user_id), request_id); }
     catch (error) { console.error('Stream token refresh failed', error.code || 'refresh_failed'); }
   });
 }

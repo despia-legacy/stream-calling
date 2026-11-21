@@ -1,0 +1,51 @@
+import Foundation
+struct StreamCallCredentials:Equatable {
+ let userId:String;var token:String;let tokenURL:String?;var registeredVoipToken:String?
+}
+enum StreamCallError:Error {case notConfigured,storageFailed,busy,connectFailed,sessionChanged,tokenRequestExpired}
+@MainActor enum StreamCallKeychain {
+ static var saved:StreamCallCredentials?;static var fail=false
+ static func save(_ c:StreamCallCredentials)->Bool {if fail{return false};saved=c;return true}
+ static func delete(){saved=nil}
+}
+@MainActor enum StreamCallTokenFetch {
+ static var gates:[CheckedContinuation<String?,Never>]=[];static var users:[String]=[]
+ static func post(_ url:String,userId:String,expired:String) async -> String? {users.append(userId);return await withCheckedContinuation {gates.append($0)}}
+}
+@MainActor final class StreamVideo {
+ let user:String;static var pausedUsers=Set<String>();static var connects:[String:CheckedContinuation<Void,Error>]=[:]
+ static var pauseDisconnect=false;static var disconnects:[CheckedContinuation<Void,Never>]=[]
+ var disconnected=false
+ init(_ user:String){self.user=user}
+ func connect() async throws {if Self.pausedUsers.contains(user){try await withCheckedThrowingContinuation {Self.connects[user]=$0}}}
+ func disconnect() async {if Self.pauseDisconnect {await withCheckedContinuation {Self.disconnects.append($0)}};disconnected=true}
+ func deleteDevice(id:String) async throws {}
+ func setVoipDevice(id:String) async throws {}
+}
+@MainActor final class CallKit {var streamVideo:StreamVideo?}
+@MainActor final class Engine {
+ var credentials:StreamCallCredentials?
+ var ledger=StreamCallLedger()
+ private var activeSession:TokenSession?;private var candidateSession:TokenSession?
+ var client:StreamVideo?;var call:Int?;var subscriptions=Set<Int>();let callKit=CallKit()
+ var voipToken:String?;var voipInvalidated=false
+ var pushState:String{"pending"}
+ var events:[(String,[String:Any])]=[]
+ var isApprovedTokenURL:(String)->Bool={_ in true}
+ var pendingTokenWaiters:[(String?)->Void]{activeSession.map{Array($0.waiters.values)} ?? []}
+ var requestIds:[String]{events.filter{$0.0=="token_needed"}.compactMap{$0.1["request_id"] as? String}}
+ func emit(_ event:String,_ data:[String:Any]){events.append((event,data))}
+ func log(_ message:String){}
+ func endSDKCall(_ l:StreamCallLedger.Live){}
+ func endedFromSDK(_ l:StreamCallLedger.Live,reason:String){_ = ledger.ended(l.cid,epoch:l.epoch,reason:reason)}
+ private func build(_ session:TokenSession)->StreamVideo {StreamVideo(session.credentials.userId)}
+ private func attach(_ c:StreamVideo,session:TokenSession){client=c;callKit.streamVideo=c}
+ func install(_ user:String,_ token:String,url:String?="https://synthetic.invalid/token") {
+  invalidate(activeSession);invalidate(candidateSession);candidateSession=nil
+  let c=StreamCallCredentials(userId:user,token:token,tokenURL:url)
+  activeSession=TokenSession(c);credentials=c;_ = StreamCallKeychain.save(c);client=StreamVideo(user);_ = ledger.logout();_ = ledger.configure()
+ }
+ func start(_ callback:@escaping(String?)->Void){refreshToken(activeSession!,callback)}
+ func startCandidate(_ callback:@escaping(String?)->Void){refreshToken(candidateSession!,callback)}
+@METHODS@
+}

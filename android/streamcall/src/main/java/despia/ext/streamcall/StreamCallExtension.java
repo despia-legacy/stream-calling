@@ -157,7 +157,7 @@ public final class StreamCallExtension implements NativeExtension, StreamCallEng
                         reply.reply(ExtResult.error("bad_token", "token is required"));
                         return;
                     }
-                    String code = engine.setToken(token);
+                    String code = engine.setToken(token, string(call, "request_id"));
                     reply.reply(code == null ? ExtResult.ok(new JSONObject()) : ExtResult.error(code, "the token was not stored"));
                     return;
                 }
