@@ -108,6 +108,14 @@ import Foundation
    StreamCallKeychain.fail=false
    check("configure_save_failure_keeps_old_session",failedSave && e.credentials?.userId=="synthetic-a" && e.client?.user=="synthetic-a")
   }
-  print("checks=17 failed=\(failed)");exit(failed==0 ? 0:1)
+  do {
+   let e=Engine();e.install("synthetic-a","a",url:nil);StreamVideo.pausedUsers.insert("synthetic-failed")
+   var stale=false
+   let attempt=Task{@MainActor in do{_ = try await e.configure(StreamCallCredentials(userId:"synthetic-failed",token:"candidate",tokenURL:nil))}catch StreamCallError.sessionChanged{stale=true}catch{}}
+   await settle{StreamVideo.connects["synthetic-failed"] != nil};await e.logout();e.install("synthetic-b","b",url:nil)
+   StreamVideo.pausedUsers.remove("synthetic-failed");StreamVideo.connects.removeValue(forKey:"synthetic-failed")!.resume(throwing:StreamCallError.connectFailed);await attempt.value
+   check("stale_connect_exception_keeps_new_session",stale && e.credentials?.userId=="synthetic-b" && StreamCallKeychain.saved?.userId=="synthetic-b")
+  }
+  print("checks=18 failed=\(failed)");exit(failed==0 ? 0:1)
  }
 }

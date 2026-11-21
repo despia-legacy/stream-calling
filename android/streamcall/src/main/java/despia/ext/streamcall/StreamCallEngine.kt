@@ -33,6 +33,8 @@ import io.getstream.video.android.model.User
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
@@ -175,7 +177,12 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
             if (configuration != operation) return@launch reply.done("session_changed", null)
             val fresh = build(session, connect = false)
             candidateClient = fresh
-            val connected = withTimeoutOrNull(15_000) { fresh.connectAsync().await() }
+            val connected = try {
+                withTimeoutOrNull(15_000) { fresh.connectAsync().await() }
+            } catch (_: Exception) {
+                currentCoroutineContext().ensureActive()
+                null
+            }
             if (configuration != operation || candidateSession !== session) {
                 removeOwnedClient(fresh)
                 return@launch reply.done("session_changed", null)

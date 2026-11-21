@@ -95,6 +95,14 @@ fun main() {
    val error=configured.await();StreamCallCredentials.fail=false
    check("configure_save_failure_restores_old_session",error=="storage_failed" && e.credentials?.userId=="synthetic-a" && e.client?.user=="synthetic-a" && StreamVideo.installed===e.client)
   }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null)
+   val gate=CompletableDeferred<Result>();StreamVideo.paused["synthetic-failed"]=gate
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-failed","candidate",null)){code,_->configured.complete(code)}
+   settle{e.client==null};val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};loggedOut.await();e.install("synthetic-b","b",null)
+   StreamVideo.paused.remove("synthetic-failed");gate.completeExceptionally(CancellationException("owned synthetic deferred cancellation"));val code=configured.await()
+   check("stale_connect_exception_keeps_new_session",code=="session_changed" && e.credentials?.userId=="synthetic-b" && StreamVideo.installed===e.client && StreamCallCredentials.saved?.userId=="synthetic-b")
+  }
  }} finally {dispatcher.close()}
- println("checks=17 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
+ println("checks=18 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
 }

@@ -129,10 +129,11 @@ final class StreamCallEngine {
         do {
             try await fresh.connect()
         } catch {
-            if candidateSession === session { candidateSession = nil }
+            let current = candidateSession === session && session.valid
+            if current { candidateSession = nil }
             invalidate(session)
             await fresh.disconnect()
-            throw StreamCallError.connectFailed
+            throw current ? StreamCallError.connectFailed : StreamCallError.sessionChanged
         }
         guard candidateSession === session, session.valid else {
             await fresh.disconnect()
