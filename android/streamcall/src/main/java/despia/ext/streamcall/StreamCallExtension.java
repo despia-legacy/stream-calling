@@ -162,7 +162,7 @@ public final class StreamCallExtension implements NativeExtension, StreamCallEng
                     return;
                 }
                 case "logout":
-                    engine.logout((code, data) -> reply.reply(ExtResult.ok(new JSONObject())));
+                    engine.logout((code, data) -> reply.reply(code == null ? ExtResult.ok(new JSONObject()) : ExtResult.error(code, "the push device cache was not cleared")));
                     return;
                 case "permissions": permissions(call, reply); return;
                 case "join": join(call, reply); return;
@@ -225,7 +225,7 @@ public final class StreamCallExtension implements NativeExtension, StreamCallEng
         }
         StreamCallCredentials c = new StreamCallCredentials(apiKey, userId, string(call, "user_name"), token,
                 string(call, "token_url"), provider);
-        engine.configure(c, (code, data) -> {
+        engine.configure(c, call::isActive, (code, data) -> {
             if (!call.isActive()) {
                 reply.reply(ExtResult.error("timeout", "configure completed after the route timed out"));
             } else if (code != null) {

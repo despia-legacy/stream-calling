@@ -7,6 +7,7 @@ import androidx.core.content.IntentCompat
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
 import com.google.firebase.messaging.RemoteMessage
+import io.getstream.android.push.PushDeviceGenerator
 import io.getstream.android.push.PushDevice
 import io.getstream.android.push.PushProvider
 import io.getstream.android.push.firebase.FirebaseMessagingDelegate
@@ -30,6 +31,10 @@ import io.getstream.video.android.core.socket.common.token.TokenProvider
 import io.getstream.video.android.model.Device
 import io.getstream.video.android.model.StreamCallId
 import io.getstream.video.android.model.User
+import kotlinx.coroutines.async
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -90,6 +95,14 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private var candidateSession: TokenSession? = null
     private var candidateClient: StreamVideo? = null
     private var configuration = 0L
+    private var deviceBarrier: Deferred<Unit>? = null
+    private var deviceCleanupFailed = false
+    private var failedCleanup: Triple<StreamVideo, StreamCallCredentials, Device?>? = null
+    private var retiringClient: StreamVideo? = null
+    private var retiringCredentials: StreamCallCredentials? = null
+    private var retiringDevice: Device? = null
+
+    fun interface CommandState { fun isActive(): Boolean }
 
     /** Application.onCreate (also when FCM starts the process): rebuild the client from storage. */
     fun restore() {
@@ -114,15 +127,45 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         register(CallType.Livestream.name, audio)
     }
 
+    // Stream keeps its first notification configuration when later clients replace its API.
+    // This generator therefore belongs to the engine, not to the first configured user.
+    private val pushGenerator = object : PushDeviceGenerator {
+        private fun selected(): TokenSession? =
+            candidateSession?.takeIf { it.valid } ?: activeSession?.takeIf { it.valid }
+
+        override fun isValidForThisDevice(): Boolean = hasFirebase() &&
+            FirebasePushDeviceGenerator(providerName = "firebase", context = app).isValidForThisDevice()
+
+        override fun onPushDeviceGeneratorSelected() {
+            scope.launch(Dispatchers.Main.immediate) {
+                val session = selected() ?: return@launch
+                if (hasFirebase()) {
+                    FirebasePushDeviceGenerator(providerName = session.credentials.fcmProvider, context = app)
+                        .onPushDeviceGeneratorSelected()
+                }
+            }
+        }
+
+        override fun asyncGeneratePushDevice(onPushDeviceGenerated: (PushDevice) -> Unit) {
+            scope.launch(Dispatchers.Main.immediate) {
+                val session = selected() ?: return@launch
+                if (!hasFirebase()) return@launch
+                val delegate = FirebasePushDeviceGenerator(providerName = session.credentials.fcmProvider, context = app)
+                delegate.onPushDeviceGeneratorSelected()
+                delegate.asyncGeneratePushDevice { device ->
+                    scope.launch(Dispatchers.Main.immediate) {
+                        if (owns(session)) onPushDeviceGenerated(device)
+                    }
+                }
+            }
+        }
+    }
+
     /** connect: false when configure() connects itself and waits for the answer. */
     private fun build(session: TokenSession, connect: Boolean = true): StreamVideo {
         val c = session.credentials
         StreamVideo.instanceOrNull()?.let { StreamVideo.removeClient() }
-        val generators = if (hasFirebase()) {
-            listOf(FirebasePushDeviceGenerator(providerName = c.fcmProvider, context = app))
-        } else {
-            emptyList()
-        }
+        val generators = listOf(pushGenerator)
         return StreamVideoBuilder(
             context = app,
             apiKey = c.apiKey,
@@ -159,24 +202,56 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         client = c
     }
 
-    fun configure(c: StreamCallCredentials, reply: Reply) {
+    fun configure(c: StreamCallCredentials, active: CommandState = CommandState { true }, reply: Reply) {
         if (ledger.live() != null) return reply.done("busy", null)
-        val old = credentials ?: StreamCallCredentials.load(host.dataDir())
-        val oldDevice = registeredDevice
+        val old = credentials ?: retiringCredentials ?: StreamCallCredentials.load(host.dataDir())
+        val previous = client ?: retiringClient
+        val oldDevice = registeredDevice ?: retiringDevice
+        val supersededClient = candidateClient
+        val supersededCredentials = candidateSession?.credentials
         configuration += 1
         val operation = configuration
         invalidate(candidateSession)
         invalidate(activeSession)
+        candidateClient = null
         activeSession = null
         credentials = null
         watchers.forEach { it.cancel() }
         watchers.clear()
         client = null
         ledger.logout()
+        retiringClient = previous
+        retiringCredentials = old
+        retiringDevice = oldDevice
         val session = TokenSession(c)
         candidateSession = session
+        if (supersededClient != null && supersededCredentials != null) {
+            retire(supersededClient, supersededCredentials, null)
+        }
+        failedCleanup?.let { retry ->
+            if (retry.first !== previous && retry.first !== supersededClient) retire(retry.first, retry.second, retry.third)
+        }
+        val cleanup = if (previous != null && old != null) {
+            retire(previous, old, oldDevice)
+        } else deviceBarrier
         scope.launch {
+            cleanup?.await()
             if (configuration != operation) return@launch reply.done("session_changed", null)
+            if (deviceCleanupFailed) {
+                invalidate(session)
+                candidateSession = null
+                return@launch reply.done("storage_failed", null)
+            }
+            if (!active.isActive()) {
+                invalidate(session)
+                candidateSession = null
+                restorePrevious(old, previous, oldDevice, operation)
+                return@launch reply.done("timeout", null)
+            }
+            // This SDK reuses its notification API manager. Retired clients must not be used
+            // for device work after the replacement has installed another user's API.
+            retiringClient = null
+            retiringDevice = null
             val fresh = build(session, connect = false)
             candidateClient = fresh
             val connected = try {
@@ -186,36 +261,71 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
                 null
             }
             if (configuration != operation || candidateSession !== session) {
-                removeOwnedClient(fresh)
+                // The newer operation owns cleanup of this installed/retiring client.
                 return@launch reply.done("session_changed", null)
             }
+            val expired = !active.isActive()
             val next = session.credentials
-            if (connected !is Result.Success || !StreamCallCredentials.save(host.dataDir(), next)) {
+            val stored = !expired && connected is Result.Success && StreamCallCredentials.save(host.dataDir(), next)
+            if (!stored) {
                 invalidate(session)
                 candidateSession = null
                 candidateClient = null
-                removeOwnedClient(fresh)
-                old?.let {
-                    val restored = TokenSession(it)
-                    activeSession = restored
-                    credentials = it
-                    attach(build(restored), restored)
-                    ledger.configure()
-                }
-                return@launch reply.done(if (connected !is Result.Success) "connect_failed" else "storage_failed", null)
+                retire(fresh, next, null).await()
+                if (configuration != operation) return@launch reply.done("session_changed", null)
+                if (deviceCleanupFailed) return@launch reply.done("storage_failed", null)
+                restorePrevious(old, previous, oldDevice, operation)
+                return@launch reply.done(if (expired) "timeout" else if (connected !is Result.Success) "connect_failed" else "storage_failed", null)
             }
             activeSession = session
             candidateSession = null
             candidateClient = null
+            retiringClient = null
+            retiringCredentials = null
+            retiringDevice = null
             credentials = next
+            registeredDevice = null
             attach(fresh, session)
             ledger.configure()
-            if (old != null && old.userId != next.userId && oldDevice != null) {
-                fresh.deleteDevice(oldDevice)
-            }
-            if (activeSession === session) registerPush(fresh, session)
+            registerPush(fresh, session)
             if (activeSession !== session) return@launch reply.done("session_changed", null)
             reply.done(null, JSONObject().put("user_id", next.userId).put("push", pushState()))
+        }
+    }
+
+    private suspend fun restorePrevious(old: StreamCallCredentials?, previous: StreamVideo?, device: Device?, operation: Long) {
+        if (configuration != operation) return
+        retiringClient = null
+        retiringCredentials = null
+        retiringDevice = null
+        if (old == null) return
+        val restored = TokenSession(old)
+        activeSession = restored
+        credentials = old
+        val restoredClient = if (previous != null && StreamVideo.instanceOrNull() === previous) previous else build(restored)
+        registeredDevice = device
+        attach(restoredClient, restored)
+        ledger.configure()
+        registerPush(restoredClient, restored)
+    }
+
+    private fun queueDeviceWork(work: suspend () -> Unit): Deferred<Unit> {
+        val previous = deviceBarrier
+        val queued = scope.async(start = CoroutineStart.LAZY) {
+            previous?.await()
+            work()
+        }
+        deviceBarrier = queued
+        queued.start()
+        return queued
+    }
+
+    private fun retire(owned: StreamVideo, c: StreamCallCredentials, device: Device?): Deferred<Unit> {
+        return queueDeviceWork {
+            try {
+                deviceCleanupFailed = !unregisterPush(owned, c, device)
+                failedCleanup = if (deviceCleanupFailed) Triple(owned, c, device) else null
+            } finally { removeOwnedClient(owned) }
         }
     }
 
@@ -251,10 +361,18 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     /** Registers this install's FCM token with Stream for the configured user; Stream records the result. */
     private suspend fun registerPush(cl: StreamVideo, session: TokenSession) {
-        val t = currentFcmToken() ?: return
-        if (activeSession !== session || client !== cl) return
-        val result = cl.createDevice(PushDevice(t, PushProvider.FIREBASE, session.credentials.fcmProvider))
-        if (result !is Result.Success) log("Push device registration failed; it is retried at the next configure")
+        val token = currentFcmToken() ?: return
+        queueDeviceWork {
+            if (activeSession === session && client === cl) {
+                try {
+                    val result = cl.createDevice(PushDevice(token, PushProvider.FIREBASE, session.credentials.fcmProvider))
+                    if (result !is Result.Success) log("Push device registration failed; it is retried at the next configure")
+                } catch (_: Exception) {
+                    currentCoroutineContext().ensureActive()
+                    log("Push device registration failed; it is retried at the next configure")
+                }
+            }
+        }.await()
     }
 
     fun setToken(token: String, requestId: String? = null): String? {
@@ -300,15 +418,20 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         if (live != null) endSdkCall(live)
         ledger.logout()
         if (live != null) emit("ended", JSONObject().put("call_cid", live.cid).put("reason", "logout"))
-        val c = credentials
-        val old = client
+        val c = credentials ?: retiringCredentials
+        val old = client ?: retiringClient
+        val device = registeredDevice ?: retiringDevice
         val pending = candidateClient
+        val pendingCredentials = candidateSession?.credentials
         configuration += 1
         invalidate(candidateSession)
         invalidate(activeSession)
         candidateSession = null
         candidateClient = null
         activeSession = null
+        retiringClient = null
+        retiringCredentials = null
+        retiringDevice = null
         credentials = null
         StreamCallCredentials.delete(host.dataDir())
         watchers.forEach { it.cancel() }
@@ -316,25 +439,41 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         unbind()
         client = null
         registeredDevice = null
-        // logOut clears local push cache, so it happens before a later configure can register.
-        old?.logOut()
-        removeOwnedClient(pending)
+        var cleanup = deviceBarrier
+        if (old != null && c != null) cleanup = retire(old, c, device)
+        if (pending != null && pending !== old && pendingCredentials != null) cleanup = retire(pending, pendingCredentials, null)
+        failedCleanup?.let { retry ->
+            if (retry.first !== old && retry.first !== pending) cleanup = retire(retry.first, retry.second, retry.third)
+        }
         scope.launch {
-            if (c != null && old != null) unregisterPush(old, c)
-            removeOwnedClient(old)
-            reply.done(null, JSONObject())
+            cleanup?.await()
+            reply.done(if (deviceCleanupFailed) "storage_failed" else null, JSONObject())
         }
     }
 
-    /** No further ring on this device: the FCM device leaves Stream before the client goes. */
-    private suspend fun unregisterPush(cl: StreamVideo, c: StreamCallCredentials) {
-        if (!hasFirebase()) return
-        val token = CompletableDeferred<String?>()
-        FirebaseMessaging.getInstance().token.addOnCompleteListener { t ->
-            token.complete(if (t.isSuccessful) t.result else null)
+    /** Server removal is best effort; awaited cache cleanup precedes replacement client creation. */
+    private suspend fun unregisterPush(cl: StreamVideo, c: StreamCallCredentials, device: Device?): Boolean {
+        var cleared = false
+        try {
+            val stored = device ?: cl.getDevice().firstOrNull()
+            val owned = stored ?: currentFcmToken()?.let {
+                Device(id = it, pushProvider = PushProvider.FIREBASE.key, pushProviderName = c.fcmProvider)
+            }
+            if (owned != null && cl.deleteDevice(owned) !is Result.Success) {
+                log("Push device removal could not be confirmed by Stream")
+            }
+        } catch (_: Exception) {
+            currentCoroutineContext().ensureActive()
+            log("Push device removal could not be confirmed by Stream")
+        } finally {
+            removeOwnedClient(cl)
+            try { cl.updateDevice(null); cleared = true }
+            catch (_: Exception) {
+                currentCoroutineContext().ensureActive()
+                log("Push device cache cleanup failed")
+            }
         }
-        val id = withTimeoutOrNull(5_000) { token.await() } ?: return
-        cl.deleteDevice(Device(id = id, pushProvider = PushProvider.FIREBASE.key, pushProviderName = c.fcmProvider))
+        return cleared
     }
 
     /**

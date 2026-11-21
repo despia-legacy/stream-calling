@@ -71,7 +71,7 @@ fun main() {
    val e=Engine(dispatcher);e.install("synthetic-a","a",null)
    val gate=CompletableDeferred<Result>();StreamVideo.paused["synthetic-candidate"]=gate
    val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-candidate","candidate",null)){code,_->configured.complete(code)}
-   settle{e.client==null};val refresh=async{e.startCandidate()};settle{e.requestIds.isNotEmpty()}
+   settle{StreamVideo.installed?.user=="synthetic-candidate"};val refresh=async{e.startCandidate()};settle{e.requestIds.isNotEmpty()}
    val error=e.setToken("candidate-new",e.requestIds[0])
    check("candidate_page_reply_does_not_overwrite_saved_user",error==null && e.credentials==null && StreamCallCredentials.saved?.userId=="synthetic-a" && refresh.await()=="candidate-new")
    StreamVideo.paused.remove("synthetic-candidate");gate.complete(Result.Success());val code=configured.await()
@@ -81,16 +81,17 @@ fun main() {
    val e=Engine(dispatcher);e.install("synthetic-a","a",null)
    val gate=CompletableDeferred<Result>();StreamVideo.paused["synthetic-stale"]=gate
    val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-stale","candidate",null)){code,_->configured.complete(code)}
-   settle{e.client==null};val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};loggedOut.await();e.install("synthetic-b","b",null)
+   settle{StreamVideo.installed?.user=="synthetic-stale"};val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};loggedOut.await();e.install("synthetic-b","b",null)
    StreamVideo.paused.remove("synthetic-stale");gate.complete(Result.Success());val code=configured.await()
    check("late_configure_cannot_commit_after_logout",code=="session_changed" && e.credentials?.userId=="synthetic-b" && StreamVideo.installed===e.client && StreamCallCredentials.saved?.userId=="synthetic-b")
   }
   run {
    val e=Engine(dispatcher);e.install("synthetic-a","a",null);val cleanup=CompletableDeferred<Unit>();e.cleanupGate=cleanup
    val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};settle{e.cleanupStarted}
-   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)};configured.await()
-   cleanup.complete(Unit);loggedOut.await()
-   check("late_logout_does_not_detach_new_client",e.client?.user=="synthetic-b" && StreamVideo.installed===e.client && !e.client!!.removed)
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)}
+   yield();val waited=!configured.isCompleted && e.client==null
+   cleanup.complete(Unit);loggedOut.await();configured.await()
+   check("late_logout_does_not_detach_new_client",waited && e.client?.user=="synthetic-b" && StreamVideo.installed===e.client && !e.client!!.removed)
   }
   run {
    val e=Engine(dispatcher);e.install("synthetic-a","a",null);StreamCallCredentials.fail=true
@@ -102,7 +103,7 @@ fun main() {
    val e=Engine(dispatcher);e.install("synthetic-a","a",null)
    val gate=CompletableDeferred<Result>();StreamVideo.paused["synthetic-failed"]=gate
    val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-failed","candidate",null)){code,_->configured.complete(code)}
-   settle{e.client==null};val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};loggedOut.await();e.install("synthetic-b","b",null)
+   settle{StreamVideo.installed?.user=="synthetic-failed"};val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};loggedOut.await();e.install("synthetic-b","b",null)
    StreamVideo.paused.remove("synthetic-failed");gate.completeExceptionally(CancellationException("owned synthetic deferred cancellation"));val code=configured.await()
    check("stale_connect_exception_keeps_new_session",code=="session_changed" && e.credentials?.userId=="synthetic-b" && StreamVideo.installed===e.client && StreamCallCredentials.saved?.userId=="synthetic-b")
   }
@@ -119,6 +120,63 @@ fun main() {
    val owner=e.eventThread;e.setToken("worker-renewed",e.requestIds[0]);val token=reply.await()
    check("worker_sdk_provider_marshals_session_state_to_main",owner=="owned-refresh-checks" && token=="worker-renewed" && e.credentials?.token=="worker-renewed")
   }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);val cleanup=CompletableDeferred<Unit>();e.cleanupGate=cleanup
+   val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};settle{e.cleanupStarted}
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)}
+   yield();val waited=StreamVideo.installed?.user!="synthetic-b" && !configured.isCompleted
+   cleanup.complete(Unit);loggedOut.await();configured.await()
+   check("same_device_cleanup_precedes_replacement_registration",waited && StreamVideo.sharedCache.value==Device() && StreamVideo.serverRows.contains("synthetic-b") && !StreamVideo.serverRows.contains("synthetic-a"))
+  }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null)
+   val failed=CompletableDeferred<Result>(Result.Failure());StreamVideo.paused["synthetic-failed-switch"]=failed
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-failed-switch","b",null)){code,_->configured.complete(code)}
+   val error=configured.await();StreamVideo.paused.remove("synthetic-failed-switch")
+   check("failed_same_device_switch_restores_registration",error=="connect_failed" && e.credentials?.userId=="synthetic-a" && StreamVideo.installed===e.client && StreamVideo.sharedCache.value==Device() && StreamVideo.serverRows.contains("synthetic-a") && !StreamVideo.serverRows.contains("synthetic-failed-switch"))
+  }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);val cleanup=CompletableDeferred<Unit>();e.cleanupGate=cleanup
+   val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)};settle{e.cleanupStarted}
+   var active=true;val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-expired","b",null),Engine.CommandState{active}){code,_->configured.complete(code)}
+   yield();active=false;cleanup.complete(Unit);loggedOut.await();val error=configured.await()
+   check("expired_route_does_not_build_after_cleanup_wait",error=="timeout" && e.client==null && StreamVideo.installed==null && StreamCallCredentials.saved==null && !StreamVideo.serverRows.contains("synthetic-expired"))
+  }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);var active=true
+   val connection=CompletableDeferred<Result>();StreamVideo.paused["synthetic-expired-connect"]=connection
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-expired-connect","b",null),Engine.CommandState{active}){code,_->configured.complete(code)}
+   settle{StreamVideo.installed?.user=="synthetic-expired-connect"};active=false;connection.complete(Result.Success());val error=configured.await();StreamVideo.paused.remove("synthetic-expired-connect")
+   check("expired_route_does_not_commit_after_connect",error=="timeout" && e.credentials?.userId=="synthetic-a" && StreamCallCredentials.saved?.userId=="synthetic-a" && StreamVideo.serverRows.contains("synthetic-a") && !StreamVideo.serverRows.contains("synthetic-expired-connect"))
+  }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);val registration=CompletableDeferred<Unit>();StreamVideo.createGates["synthetic-a"]=registration
+   val pending=async{e.registerActive()};settle{StreamVideo.createStarted.contains("synthetic-a")}
+   val loggedOut=CompletableDeferred<Unit>();e.logout{_,_->loggedOut.complete(Unit)}
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)}
+   yield();val waited=!configured.isCompleted && StreamVideo.installed?.user!="synthetic-b"
+   registration.complete(Unit);pending.await();loggedOut.await();configured.await()
+   check("old_inflight_registration_finishes_before_cleanup_and_replacement",waited && StreamVideo.sharedCache.value==Device() && StreamVideo.serverRows.contains("synthetic-b") && !StreamVideo.serverRows.contains("synthetic-a"))
+  }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);val cleanup=CompletableDeferred<Unit>();e.cleanupGate=cleanup
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)}
+   settle{e.cleanupStarted};val waited=StreamVideo.installed?.user!="synthetic-b" && !configured.isCompleted
+   cleanup.complete(Unit);configured.await()
+   check("direct_switch_cleanup_precedes_sdk_auto_registration",waited && e.credentials?.userId=="synthetic-b" && StreamVideo.sharedCache.value==Device() && StreamVideo.serverRows.contains("synthetic-b") && !StreamVideo.serverRows.contains("synthetic-a"))
+  }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);StreamVideo.clearFailures.add("synthetic-a")
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)}
+   val failed=configured.await();val blocked=failed=="storage_failed" && StreamVideo.installed?.user!="synthetic-b" && StreamCallCredentials.saved?.userId=="synthetic-a"
+   StreamVideo.clearFailures.clear();val retry=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->retry.complete(code)}
+   check("cache_storage_failure_is_visible_and_retryable",blocked && retry.await()==null && e.credentials?.userId=="synthetic-b" && StreamVideo.serverRows.contains("synthetic-b"))
+  }
+  run {
+   val e=Engine(dispatcher);e.install("synthetic-a","a",null);StreamVideo.deleteFailures.add("synthetic-a")
+   val configured=CompletableDeferred<String?>();e.configure(StreamCallCredentials("synthetic-b","b",null)){code,_->configured.complete(code)}
+   check("server_delete_failure_keeps_best_effort_truth",configured.await()==null && StreamVideo.serverRows.contains("synthetic-a") && StreamVideo.serverRows.contains("synthetic-b") && e.credentials?.userId=="synthetic-b")
+  }
  }} finally {Dispatchers.resetMain();dispatcher.close()}
- println("checks=20 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
+ println("checks=28 failed=$failed");kotlin.system.exitProcess(if(failed==0)0 else 1)
 }

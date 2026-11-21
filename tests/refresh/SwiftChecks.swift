@@ -123,6 +123,13 @@ import Foundation
    provider {calls+=1;answer=$0};await Task.yield()
    check("obsolete_provider_entry_completes_without_work",calls==1 && answer==nil && e.requestIds.isEmpty && StreamCallTokenFetch.users.count==fetches && e.credentials?.userId=="synthetic-b")
   }
-  print("checks=19 failed=\(failed)");exit(failed==0 ? 0:1)
+  do {
+   let e=Engine();e.install("synthetic-a","a",url:nil);StreamVideo.pausedUsers.insert("synthetic-expired-connect");var active=true;var expired=false
+   let attempt=Task{@MainActor in do{_ = try await e.configure(StreamCallCredentials(userId:"synthetic-expired-connect",token:"b",tokenURL:nil),isActive:{active})}catch StreamCallError.timedOut{expired=true}catch{}}
+   await settle{StreamVideo.connects["synthetic-expired-connect"] != nil};active=false
+   StreamVideo.pausedUsers.remove("synthetic-expired-connect");StreamVideo.connects.removeValue(forKey:"synthetic-expired-connect")!.resume();await attempt.value
+   check("expired_route_does_not_commit_after_connect",expired && e.credentials?.userId=="synthetic-a" && StreamCallKeychain.saved?.userId=="synthetic-a")
+  }
+  print("checks=20 failed=\(failed)");exit(failed==0 ? 0:1)
  }
 }

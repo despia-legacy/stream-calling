@@ -14,7 +14,28 @@ output.mkdir(parents=True, exist_ok=True)
 
 def method(source, marker):
     start = source.index(marker)
-    opening = source.index('{', start)
+    arguments, quote, escaped = 0, False, False
+    opening = None
+    for at in range(start, len(source)):
+        character = source[at]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == '\\':
+                escaped = True
+            elif character == '"':
+                quote = False
+        elif character == '"':
+            quote = True
+        elif character == '(':
+            arguments += 1
+        elif character == ')':
+            arguments -= 1
+        elif character == '{' and arguments == 0:
+            opening = at
+            break
+    if opening is None:
+        raise ValueError('Production body missing: ' + marker)
     depth, quote, escaped = 0, False, False
     for at in range(opening, len(source)):
         character = source[at]
@@ -44,6 +65,8 @@ platforms = [
     ('Kotlin', REPO / 'android/streamcall/src/main/java/despia/ext/streamcall',
      'StreamCallEngine.kt', 'StreamCallLedger.java',
      ['    private class TokenSession', '    fun configure(', '    private fun removeOwnedClient(',
+      '    private suspend fun restorePrevious(', '    private fun queueDeviceWork(', '    private fun retire(',
+      '    private suspend fun registerPush(', '    private suspend fun unregisterPush(',
       '    fun setToken(', '    private fun owns(', '    private fun invalidate(',
       '    private fun storeToken(', '    fun logout(', '    private suspend fun refreshToken(']),
 ]

@@ -92,7 +92,7 @@ final class StreamCallExtension: NativeExtension, NativeExtVoIPHandler {
                                           token: token, tokenURL: call.params["token_url"] as? String,
                                           voipProvider: provider, registeredVoipToken: nil)
         do {
-            let push = try await engine.configure(creds)
+            let push = try await engine.configure(creds, isActive: { call.isActive })
             guard call.isActive else { return .error(code: "timeout", message: "configure completed after the route timed out") }
             return .ok(["user_id": userId, "push": push])
         } catch let e as StreamCallError {

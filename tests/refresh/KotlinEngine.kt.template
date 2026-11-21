@@ -1,5 +1,6 @@
 package despia.ext.streamcall
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.*
 import org.json.JSONObject
 class StreamCallCredentials(val userId:String,val token:String,val tokenUrl:String?,val fcmProvider:String="fixture") {
  fun withToken(t:String)=StreamCallCredentials(userId,t,tokenUrl,fcmProvider)
@@ -7,15 +8,39 @@ class StreamCallCredentials(val userId:String,val token:String,val tokenUrl:Stri
  fun save(dir:java.io.File,c:StreamCallCredentials):Boolean{if(fail)return false;saved=c;return true}
  fun load(dir:java.io.File)=saved;fun delete(dir:java.io.File){saved=null}}
 }
-class Device
-sealed class Result {class Success:Result()}
+data class Device(val id:String="same-token",val pushProvider:String="firebase",val pushProviderName:String="fixture")
+class PushDevice(val id:String,val provider:PushProvider,val name:String)
+enum class PushProvider(val key:String){FIREBASE("firebase")}
+sealed class Result {class Success:Result();class Failure:Result()}
 class StreamVideo(val user:String) {
- companion object {var installed:StreamVideo?=null;val paused=mutableMapOf<String,CompletableDeferred<Result>>()
- fun instanceOrNull()=installed;fun removeClient(){installed?.removed=true;installed=null}}
+ companion object {
+  var installed:StreamVideo?=null
+  val paused=mutableMapOf<String,CompletableDeferred<Result>>()
+  val sharedCache=MutableStateFlow<Device?>(null)
+  val serverRows=mutableSetOf<String>()
+  val deleteGates=mutableMapOf<String,CompletableDeferred<Unit>>()
+  val deleteStarted=mutableSetOf<String>()
+  val createGates=mutableMapOf<String,CompletableDeferred<Unit>>()
+  val createStarted=mutableSetOf<String>()
+  val clearFailures=mutableSetOf<String>()
+  val deleteFailures=mutableSetOf<String>()
+  fun instanceOrNull()=installed
+  fun removeClient(){installed?.removed=true;installed=null}
+ }
  var removed=false
  fun connectAsync()=paused[user] ?: CompletableDeferred<Result>(Result.Success())
- suspend fun deleteDevice(d:Device){}
- fun logOut(){}
+ fun autoRegister(){if(sharedCache.value!=Device()){serverRows.add(user);sharedCache.value=Device()}}
+ fun getDevice():Flow<Device?> = sharedCache
+ suspend fun deleteDevice(d:Device):Result {
+  deleteStarted.add(user);deleteGates[user]?.await();if(deleteFailures.contains(user))return Result.Failure();serverRows.remove(user)
+  if(sharedCache.value==d)sharedCache.value=null
+  return Result.Success()
+ }
+ suspend fun updateDevice(d:Device?){if(clearFailures.contains(user))throw IllegalStateException("owned storage fixture");sharedCache.value=d}
+ suspend fun createDevice(d:PushDevice):Result {
+  createStarted.add(user);createGates[user]?.await();serverRows.add(user);sharedCache.value=Device(d.id,d.provider.key,d.name)
+  return Result.Success()
+ }
 }
 interface TokenProvider {suspend fun loadToken():String}
 class Host {fun dataDir()=java.io.File("unused");fun isApprovedTokenUrl(u:String)=true}
@@ -24,9 +49,21 @@ class Engine(dispatcher:CoroutineDispatcher=Dispatchers.Unconfined) {
  var credentials:StreamCallCredentials?=null;val ledger=StreamCallLedger();val host=Host()
  val scope=CoroutineScope(SupervisorJob()+dispatcher)
  private var activeSession:TokenSession?=null;private var candidateSession:TokenSession?=null
- private var candidateClient:StreamVideo?=null;var client:StreamVideo?=null;var call:Int?=null
+ private var candidateClient:StreamVideo?=null
+ private var deviceBarrier:Deferred<Unit>?=null
+ private var deviceCleanupFailed=false
+ private var failedCleanup:Triple<StreamVideo,StreamCallCredentials,Device?>?=null
+ private var retiringClient:StreamVideo?=null
+ private var retiringCredentials:StreamCallCredentials?=null
+ private var retiringDevice:Device?=null
+ fun interface CommandState {fun isActive():Boolean}
+ init {StreamVideo.sharedCache.value=null;StreamVideo.serverRows.clear();StreamVideo.deleteGates.clear();StreamVideo.deleteStarted.clear();StreamVideo.createGates.clear();StreamVideo.createStarted.clear();StreamVideo.clearFailures.clear();StreamVideo.deleteFailures.clear()}
+var client:StreamVideo?=null;var call:Int?=null
  var configuration=0L;var watchers=mutableListOf<Job>();var registeredDevice:Device?=null
- var cleanupGate:CompletableDeferred<Unit>?=null;var cleanupStarted=false
+ private var cleanupUser:String?=null
+ var cleanupGate:CompletableDeferred<Unit>?=null
+  set(value){field=value;cleanupUser=client?.user;if(value!=null && cleanupUser!=null)StreamVideo.deleteGates[cleanupUser!!]=value}
+ val cleanupStarted:Boolean get()=StreamVideo.deleteStarted.contains(cleanupUser)
  val events=mutableListOf<Pair<String,JSONObject>>()
  @Volatile var eventThread:String?=null
  private val NO_TOKEN=""
@@ -40,19 +77,20 @@ class Engine(dispatcher:CoroutineDispatcher=Dispatchers.Unconfined) {
  fun endedFromSdk(l:StreamCallLedger.Live,reason:String){ledger.ended(l.cid,l.epoch,reason)}
  fun pushState()="pending"
  fun unbind(){call=null}
- private suspend fun registerPush(cl:StreamVideo,s:TokenSession){}
- suspend fun unregisterPush(cl:StreamVideo,c:StreamCallCredentials){cleanupStarted=true;cleanupGate?.await()}
+ suspend fun currentFcmToken():String?="same-token"
+ fun log(message:String){}
  private fun build(s:TokenSession,connect:Boolean=true):StreamVideo {
-  StreamVideo.instanceOrNull()?.let{StreamVideo.removeClient()};return StreamVideo(s.credentials.userId).also{StreamVideo.installed=it}
+  StreamVideo.instanceOrNull()?.let{StreamVideo.removeClient()};return StreamVideo(s.credentials.userId).also{StreamVideo.installed=it;it.autoRegister()}
  }
  private fun attach(c:StreamVideo,s:TokenSession){client=c}
  fun install(user:String,token:String,url:String?="https://synthetic.invalid/token") {
   invalidate(activeSession);invalidate(candidateSession);candidateSession=null
   val c=StreamCallCredentials(user,token,url);activeSession=TokenSession(c);credentials=c;StreamCallCredentials.save(host.dataDir(),c)
-  client=StreamVideo(user);StreamVideo.installed=client;ledger.logout();ledger.configure()
+  client=StreamVideo(user);StreamVideo.installed=client;StreamVideo.sharedCache.value=Device();StreamVideo.serverRows.add(user);ledger.logout();ledger.configure()
  }
  fun nativeProvider():TokenProvider {val session=activeSession!!;return object:TokenProvider {@PROVIDER@}}
  fun provider():suspend ()->String? {val session=activeSession!!;return {refreshToken(session)}}
+ suspend fun registerActive(){registerPush(client!!,activeSession!!)}
  suspend fun start():String?=refreshToken(activeSession!!)
  suspend fun startCandidate():String?=refreshToken(candidateSession!!)
 @METHODS@

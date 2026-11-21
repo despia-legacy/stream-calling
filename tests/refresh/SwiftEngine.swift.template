@@ -2,7 +2,7 @@ import Foundation
 struct StreamCallCredentials:Equatable {
  let userId:String;var token:String;let tokenURL:String?;var registeredVoipToken:String?
 }
-enum StreamCallError:Error {case notConfigured,storageFailed,busy,connectFailed,sessionChanged,tokenRequestExpired}
+enum StreamCallError:Error {case notConfigured,storageFailed,busy,connectFailed,sessionChanged,tokenRequestExpired,timedOut}
 @MainActor enum StreamCallKeychain {
  static var saved:StreamCallCredentials?;static var fail=false
  static func save(_ c:StreamCallCredentials)->Bool {if fail{return false};saved=c;return true}

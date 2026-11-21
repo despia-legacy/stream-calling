@@ -118,7 +118,7 @@ final class StreamCallEngine {
     }
 
     /// Stores the credentials and connects. Replies with the push state; throws a code.
-    func configure(_ c: StreamCallCredentials) async throws -> String {
+    func configure(_ c: StreamCallCredentials, isActive: @escaping () -> Bool = { true }) async throws -> String {
         if ledger.live != nil { throw StreamCallError.busy }
         var next = c
         if credentials?.userId == c.userId { next.registeredVoipToken = credentials?.registeredVoipToken }
@@ -138,6 +138,12 @@ final class StreamCallEngine {
         guard candidateSession === session, session.valid else {
             await fresh.disconnect()
             throw StreamCallError.sessionChanged
+        }
+        guard isActive() else {
+            candidateSession = nil
+            invalidate(session)
+            await fresh.disconnect()
+            throw StreamCallError.timedOut
         }
         if ledger.live != nil {
             candidateSession = nil
@@ -535,7 +541,7 @@ final class StreamCallEngine {
 }
 
 enum StreamCallError: Error {
-    case notConfigured, tokenExpired, busy, connectFailed, storageFailed, noCall, routeFailed, sessionChanged, tokenRequestExpired
+    case notConfigured, tokenExpired, busy, connectFailed, storageFailed, noCall, routeFailed, sessionChanged, tokenRequestExpired, timedOut
 
     var code: String {
         switch self {
@@ -548,6 +554,7 @@ enum StreamCallError: Error {
         case .routeFailed: return "route_failed"
         case .sessionChanged: return "session_changed"
         case .tokenRequestExpired: return "token_request_expired"
+        case .timedOut: return "timeout"
         }
     }
 }
