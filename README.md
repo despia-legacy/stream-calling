@@ -236,6 +236,10 @@ Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a
 - Account switching is experimental. Verify push-device registrations in your Stream project when changing users.
 - Background ringing and Lock Screen answering remain preview features.
 
+## Verification
+
+Controlled build hosts compiled and linked this extension against StreamVideo 1.57.0 on iOS and Stream Video 1.35.0 with push 1.3.4 on Android. This verifies native SDK compatibility. Live calls, account configuration, background push delivery, native bridge execution and device storage behavior remain unverified.
+
 ## License
 
 [Despia V3 Extension Source-Available Commercial License](LICENSE).
