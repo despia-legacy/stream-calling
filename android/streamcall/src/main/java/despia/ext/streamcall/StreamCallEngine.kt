@@ -13,9 +13,11 @@ import io.getstream.android.push.PushDevice
 import io.getstream.android.push.PushProvider
 import io.getstream.android.push.firebase.FirebaseMessagingDelegate
 import io.getstream.android.push.firebase.FirebasePushDeviceGenerator
+import io.getstream.android.video.generated.models.CallRejectedEvent
 import io.getstream.result.Result
 import io.getstream.video.android.core.Call
 import io.getstream.video.android.core.CreateCallOptions
+import io.getstream.video.android.core.EventSubscription
 import io.getstream.video.android.core.GEO
 import io.getstream.video.android.core.RealtimeConnection
 import io.getstream.video.android.core.RingingState
@@ -99,6 +101,10 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private var pushCaller: Triple<String, String, String>? = null
     /** The cid of Stream's last missed-call push: Stream ends that ring as rejected by this user. */
     private var missedPush: String? = null
+    /** The ringing cid this user declined (a call.rejected event from this user, here or on another
+     *  device). Stream's rejectedBy cannot tell: it keeps an earlier ring's refusal of the same cid. */
+    @Volatile private var declinedRing: String? = null
+    private var rejections: EventSubscription? = null
     private var candidateSession: TokenSession? = null
     private var candidateClient: StreamVideo? = null
     private var configuration = 0L
@@ -726,6 +732,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         val o = ledger.incoming(ringing.cid)
         if (o.isOk) {
             if (missedPush == ringing.cid) missedPush = null
+            if (declinedRing == ringing.cid) declinedRing = null
             bind(ringing)
             val by = ringing.state.createdBy.value
             val pushed = pushCaller?.takeIf { it.first == ringing.cid }
@@ -761,6 +768,10 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private fun bind(c: Call) {
         unbind()
         call = c
+        // Stream hands a call's subscriptions each event before it updates that call's state.
+        rejections = c.subscribeFor(CallRejectedEvent::class.java) { e ->
+            if ((e as? CallRejectedEvent)?.user?.id == credentials?.userId) declinedRing = c.cid
+        }
         val l = ledger.live() ?: return
         callWatchers = mutableListOf(
             scope.launch {
@@ -791,14 +802,16 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     }
 
     /** Why Stream ended an incoming ring, as on iOS: Stream's missed push, this user's own rejection
-     *  (here or on another device), else the caller (rejected or ended the call while it rang). */
+     *  during this ring (here or on another device), else the caller (rejected or ended the call). */
     private fun incomingEnd(c: Call): String = when {
         missedPush == c.cid -> "missed"
-        credentials?.userId in c.state.rejectedBy.value -> "declined"
+        declinedRing == c.cid -> "declined"
         else -> "cancelled"
     }
 
     private fun unbind() {
+        rejections?.dispose()
+        rejections = null
         callWatchers.forEach { it.cancel() }
         callWatchers = mutableListOf()
         call = null
