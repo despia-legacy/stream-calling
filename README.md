@@ -205,9 +205,23 @@ Every event carries `call_cid` and a growing `seq`.
 | `error`        | `onStreamcallError`         | `app` |
 | `token_needed` | `onStreamcallTokenNeeded`   | `app` |
 
+### End reasons
+
+`ended` carries one of these reasons, the same on iOS and Android:
+
+- `declined`: this user declined the ring, on this device or another one.
+- `answered_elsewhere`: this user answered the ring on another device or session.
+- `missed`: the ring ended unanswered here. The caller hung up or rejected it, or it timed out. This is the `call.missed` event Stream sends the callee.
+- `rejected`: every member rejected this user's outgoing ring.
+- `remote`: the other side ended a joined call.
+- `local`: this side left a joined call, in the app or in the system call UI.
+- `failed`, `logout`, `token_expired`.
+
+While an outgoing call rings, each member who rejects it sends `error` with the code `rejected`. The event carries `user_id` (who rejected) and, when Stream gives one, `reason`.
+
 ### Error codes
 
-Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a join while the recorder sample records), `permission_denied`, `connect_failed`, `storage_failed`, `bad_token`, `token_request_expired` (a refresh request is no longer pending), `session_changed` (configure was superseded by logout or another configure) and, for a failed audio route change, `route_failed`.
+Besides the standard codes: `rejected` (a member rejected this user's outgoing ring), `not_configured`, `busy`, `no_call`, `audio_busy` (a join while the recorder sample records), `permission_denied`, `connect_failed`, `storage_failed`, `bad_token`, `token_request_expired` (a refresh request is no longer pending), `session_changed` (configure was superseded by logout or another configure) and, for a failed audio route change, `route_failed`.
 
 ---
 

@@ -15,6 +15,7 @@ import io.getstream.android.push.PushDevice
 import io.getstream.android.push.PushProvider
 import io.getstream.android.push.firebase.FirebaseMessagingDelegate
 import io.getstream.android.push.firebase.FirebasePushDeviceGenerator
+import io.getstream.android.video.generated.models.CallAcceptedEvent
 import io.getstream.android.video.generated.models.CallMissedEvent
 import io.getstream.android.video.generated.models.CallRejectedEvent
 import io.getstream.result.Result
@@ -114,8 +115,14 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     @Volatile private var timedOutRing: String? = null
     /** The ringing cid Stream sent this user call.missed for over its connection. */
     @Volatile private var missedRing: String? = null
+    /** The ringing cid this user accepted on another device or session. Stream's CallState leaves a
+     *  ringing call that this user accepted elsewhere (a call.accepted event from this user that this
+     *  device did not accept); iOS names that end "answered_elsewhere". */
+    @Volatile private var acceptedElsewhere: String? = null
     private var rejections: EventSubscription? = null
     private var missedEvents: EventSubscription? = null
+    private var memberRejections: EventSubscription? = null
+    private var accepts: EventSubscription? = null
     /** The ringing cid and its rejectActionBundle when the ring was taken. Stream's system-UI decline
      *  (notification, Lock Screen, wearable) sets a new bundle, and no call.rejected echo arrives while
      *  the app is in the background. */
@@ -788,6 +795,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         val o = ledger.incoming(ringing.cid)
         if (o.isOk) {
             if (missedPush == ringing.cid) missedPush = null
+            if (acceptedElsewhere == ringing.cid) acceptedElsewhere = null
             if (declinedRing == ringing.cid) declinedRing = null
             if (timedOutRing == ringing.cid) timedOutRing = null
             if (missedRing == ringing.cid) missedRing = null
@@ -842,6 +850,18 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         }
         // Stream sends the callee call.missed when a ring ends unanswered (Ring Calls docs).
         missedEvents = c.subscribeFor(CallMissedEvent::class.java) { missedRing = c.cid }
+        // Accepted by this user while it still rings here: accepted on another device or session.
+        accepts = c.subscribeFor(CallAcceptedEvent::class.java) { e ->
+            val a = e as? CallAcceptedEvent
+            val now = ledger.live()
+            if (a?.user?.id == credentials?.userId && now != null && now.cid == c.cid && now.incoming &&
+                now.state() == StreamCallLedger.RINGING) acceptedElsewhere = c.cid
+        }
+        // A member's rejection of this user's outgoing ring, told with who rejected, as on iOS.
+        memberRejections = c.subscribeFor(CallRejectedEvent::class.java) { e ->
+            val r = e as? CallRejectedEvent
+            if (r != null && r.user.id != credentials?.userId) scope.launch { memberRejected(c.cid, r.user.id, r.reason) }
+        }
         val l = ledger.live() ?: return
         callWatchers = mutableListOf(
             scope.launch {
@@ -883,9 +903,22 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
      *  "missed", the event Stream itself sends the callee (call.missed, over its connection or by push):
      *  the caller hung up or rejected it, or the ring timed out. */
     private fun incomingEnd(c: Call): String = when {
+        acceptedElsewhere == c.cid -> "answered_elsewhere"
         missedPush == c.cid || timedOutRing == c.cid || missedRing == c.cid -> "missed"
         declinedRing == c.cid || declinedHere(c) -> "declined"
         else -> "missed"
+    }
+
+    /** A member rejected this user's outgoing ring: the page is told who rejected and Stream's reason,
+     *  the same shape as on iOS. The call itself ends as "rejected" once every member has rejected
+     *  (Stream's RingingState.RejectedByAll). */
+    private fun memberRejected(cid: String, userId: String, reason: String?) {
+        val l = ledger.live() ?: return
+        if (l.cid != cid || l.incoming || l.state() == StreamCallLedger.JOINED) return
+        val data = JSONObject().put("code", "rejected").put("message", "a member declined the call")
+            .put("call_cid", cid).put("user_id", userId)
+        if (!reason.isNullOrEmpty()) data.put("reason", reason)
+        emit("error", data)
     }
 
     /** Stream's system-UI decline set a new rejectActionBundle on this call during its ring. */
@@ -899,6 +932,10 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         rejections = null
         missedEvents?.dispose()
         missedEvents = null
+        memberRejections?.dispose()
+        memberRejections = null
+        accepts?.dispose()
+        accepts = null
         callWatchers.forEach { it.cancel() }
         callWatchers = mutableListOf()
         call = null

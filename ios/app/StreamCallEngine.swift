@@ -591,9 +591,20 @@ final class StreamCallEngine {
             if l.incoming, l.state == .ringing {
                 endedFromSDK(l, reason: e.user.id == credentials?.userId ? "declined" : "missed")
             } else if !l.incoming, l.state != .joined {
-                // Ringing an outgoing call: every rejection is a member's; the caller stays until
-                // the SDK ends the call or the page leaves.
-                emit("error", ["code": "rejected", "message": "a member declined the call", "call_cid": l.cid])
+                // Ringing an outgoing call: each member's rejection is told with who rejected and
+                // Stream's reason. Once every member but this user has rejected (the session's
+                // rejectedBy), the call ends as "rejected": the same name and shape as on Android,
+                // where Stream's RingingState.RejectedByAll ends it.
+                var info: [String: Any] = ["code": "rejected", "message": "a member declined the call",
+                                           "call_cid": l.cid, "user_id": e.user.id]
+                if let reason = e.reason, !reason.isEmpty { info["reason"] = reason }
+                emit("error", info)
+                let members = Set((call?.state.members ?? []).map(\.id)).subtracting([credentials?.userId ?? ""])
+                let rejected = Set((e.call.session?.rejectedBy ?? [:]).keys)
+                if !members.isEmpty, members.isSubset(of: rejected) {
+                    endSDKCall(l)
+                    endedFromSDK(l, reason: "rejected")
+                }
             }
         case .typeCallMissedEvent(let e) where e.callCid == l.cid && l.incoming:
             endedFromSDK(l, reason: "missed")
