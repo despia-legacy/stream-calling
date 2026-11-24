@@ -13,7 +13,12 @@ import StreamVideo
 ///   `registerForIncomingCalls`, which would create Stream's own second registry.
 /// - CallKit: Stream's `CallKitService` is the app's one CXProvider. The template gives it the
 ///   client and reports each push through it, so CallKit's audio activation reaches Stream's audio
-///   stack through Stream's own delegate.
+///   stack through Stream's own delegate. Stream's service cannot be created before a `StreamVideo`
+///   exists in the process (its init reads the injected client and stops the app without one), so
+///   nothing here touches `callKit` or `callKitAdapter` until `build` has made one (`streamBuilt`).
+///   A VoIP push that arrives before that (a launch with no stored user) is reported through a
+///   one-shot provider that is invalidated as soon as the call is ended, so there is still only
+///   one provider in use at any time.
 /// - Audio session: the template never configures, activates or deactivates it. CallKit and Stream
 ///   do; the template only reads it (release only what you activated, and this file activates
 ///   nothing).
@@ -44,6 +49,9 @@ final class StreamCallEngine {
     private var activeSession: TokenSession?
     private var candidateSession: TokenSession?
     private var routeObserver: NSObjectProtocol?
+    /// True once a `StreamVideo` exists in this process; only then can Stream's CallKit service exist.
+    private var streamBuilt = false
+    private var callKitPrepared = false
 
     @Injected(\.callKitService) private var callKit
     /// Used only for its `callSettings` (audio on, video off) and the CallKit appearance; its
@@ -55,8 +63,6 @@ final class StreamCallEngine {
     /// Process start, including a background launch for a VoIP push: rebuild the client from what
     /// `configure` stored, so the push that woke the app can be reported and answered.
     func restore() {
-        callKitAdapter.callSettings = CallSettings(audioOn: true, videoOn: false, speakerOn: false)
-        callKit.supportsVideo = false
         routeObserver = NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification,
                                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.routeChanged() }
@@ -71,6 +77,7 @@ final class StreamCallEngine {
 
     private func build(_ session: TokenSession) -> StreamVideo {
         let c = session.credentials
+        defer { streamBuilt = true }
         return StreamVideo(apiKey: c.apiKey,
                     user: User(id: c.userId, name: c.userName),
                     token: UserToken(rawValue: c.token),
@@ -88,6 +95,11 @@ final class StreamCallEngine {
     private func attach(_ c: StreamVideo, session: TokenSession) {
         subscriptions.removeAll()
         client = c
+        if !callKitPrepared {
+            callKitPrepared = true
+            callKitAdapter.callSettings = CallSettings(audioOn: true, videoOn: false, speakerOn: false)
+            callKit.supportsVideo = false
+        }
         callKit.streamVideo = c
         c.eventPublisher()
             .receive(on: DispatchQueue.main)
@@ -256,7 +268,7 @@ final class StreamCallEngine {
         subscriptions.removeAll()
         let c = client
         client = nil
-        callKit.streamVideo = nil
+        if streamBuilt { callKit.streamVideo = nil }
         let registered = credentials?.registeredVoipToken
         credentials = nil
         StreamCallKeychain.delete()
@@ -359,17 +371,21 @@ final class StreamCallEngine {
 
     /// A push with no call cid, or one that arrives with no configured client (after `logout`, or
     /// before the first `configure`): Stream's service would report it but keep no entry, so nothing
-    /// could end it. It is reported through the same provider (Stream's, the app's one CXProvider)
-    /// and ended as failed inside the report's completion; PushKit's completion runs after both.
+    /// could end it. It is reported through Stream's provider when a client was built in this
+    /// process, else through a one-shot provider (Stream's service cannot exist yet), ended as failed
+    /// inside the report's completion, and the one-shot provider is invalidated; PushKit's completion
+    /// runs after both.
     private func reportUntracked(_ push: StreamCallRules.Push, _ once: StreamCallOnce) {
         let uuid = UUID()
         let update = CXCallUpdate()
         update.remoteHandle = CXHandle(type: .generic, value: push.callerId)
         update.localizedCallerName = push.callerName
         update.hasVideo = false
-        let provider = callKit.callProvider
+        let oneShot = !streamBuilt
+        let provider = oneShot ? CXProvider(configuration: CXProviderConfiguration()) : callKit.callProvider
         provider.reportNewIncomingCall(with: uuid, update: update) { error in
             if error == nil { provider.reportCall(with: uuid, endedAt: nil, reason: .failed) }
+            if oneShot { provider.invalidate() }
             once.run()
         }
         log(push.isCallCid ? "VoIP push with no configured client: reported and ended" : "VoIP push with no call: reported and ended")
