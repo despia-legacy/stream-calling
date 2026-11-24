@@ -49,6 +49,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -104,7 +105,13 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     /** The ringing cid this user declined (a call.rejected event from this user, here or on another
      *  device). Stream's rejectedBy cannot tell: it keeps an earlier ring's refusal of the same cid. */
     @Volatile private var declinedRing: String? = null
+    /** The ringing cid Stream's own ring timer rejected for this user ("timeout"): a missed ring. */
+    @Volatile private var timedOutRing: String? = null
     private var rejections: EventSubscription? = null
+    /** The ringing cid and its rejectActionBundle when the ring was taken. Stream's system-UI decline
+     *  (notification, Lock Screen, wearable) sets a new bundle, and no call.rejected echo arrives while
+     *  the app is in the background. */
+    private var ringBundle: Pair<String, Bundle?>? = null
     private var candidateSession: TokenSession? = null
     private var candidateClient: StreamVideo? = null
     private var configuration = 0L
@@ -733,6 +740,8 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         if (o.isOk) {
             if (missedPush == ringing.cid) missedPush = null
             if (declinedRing == ringing.cid) declinedRing = null
+            if (timedOutRing == ringing.cid) timedOutRing = null
+            ringBundle = ringing.cid to ringing.state.rejectActionBundle.value
             bind(ringing)
             val by = ringing.state.createdBy.value?.takeIf { it.id.isNotEmpty() }
             val pushed = pushCaller?.takeIf { it.first == ringing.cid }
@@ -740,7 +749,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
             val callerName = by?.userNameOrId ?: pushed?.third?.ifEmpty { null } ?: callerId
             if (callerId.isEmpty()) {
                 val creator = if (ringing.state.createdBy.value == null) "none" else "blank"
-                log("ring ${ringing.cid}: no caller yet (creator $creator, push ${if (pushCaller == null) "none" else "another cid"})")
+                log("ring ${ringing.cid}: no caller yet (creator $creator, push ${pushCaller?.first ?: "none"})")
             }
             // Rung over Stream's connection (app running): Stream shows no system ring for that by
             // itself, so it is shown through Stream's own push path, exactly as for an FCM ring.
@@ -774,7 +783,10 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         call = c
         // Stream hands a call's subscriptions each event before it updates that call's state.
         rejections = c.subscribeFor(CallRejectedEvent::class.java) { e ->
-            if ((e as? CallRejectedEvent)?.user?.id == credentials?.userId) declinedRing = c.cid
+            val r = e as? CallRejectedEvent
+            if (r?.user?.id == credentials?.userId) {
+                if (r?.reason == "timeout") timedOutRing = c.cid else declinedRing = c.cid
+            }
         }
         val l = ledger.live() ?: return
         callWatchers = mutableListOf(
@@ -794,6 +806,13 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
                     val now = ledger.live() ?: return@collect
                     if (now.epoch != l.epoch) return@collect
                     if (conn is RealtimeConnection.Failed || conn is RealtimeConnection.ReconnectingFailed) endedFromSdk(now, "failed")
+                    else if (conn is RealtimeConnection.Disconnected && now.incoming && now.state() == StreamCallLedger.RINGING) {
+                        // Stream left the ringing call (its leave sets Disconnected): a ringing-state end
+                        // dispatched with that leave decides first, else the ring ends here.
+                        yield()
+                        val still = ledger.live()
+                        if (still != null && still.epoch == l.epoch && still.state() == StreamCallLedger.RINGING) endedFromSdk(still, incomingEnd(c))
+                    }
                 }
             },
             scope.launch {
@@ -808,9 +827,17 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     /** Why Stream ended an incoming ring, as on iOS: Stream's missed push, this user's own rejection
      *  during this ring (here or on another device), else the caller (rejected or ended the call). */
     private fun incomingEnd(c: Call): String = when {
-        missedPush == c.cid -> "missed"
-        declinedRing == c.cid -> "declined"
+        missedPush == c.cid || timedOutRing == c.cid -> "missed"
+        declinedRing == c.cid || declinedHere(c) -> "declined"
+        // Stream left a ring nobody rejected: its own ring timer (Incoming, then leave).
+        c.state.ringingState.value is RingingState.Incoming -> "missed"
         else -> "cancelled"
+    }
+
+    /** Stream's system-UI decline set a new rejectActionBundle on this call during its ring. */
+    private fun declinedHere(c: Call): Boolean {
+        val start = ringBundle ?: return false
+        return start.first == c.cid && c.state.rejectActionBundle.value !== start.second
     }
 
     private fun unbind() {
