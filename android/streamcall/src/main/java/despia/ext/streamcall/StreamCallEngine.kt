@@ -102,7 +102,9 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private var activeSession: TokenSession? = null
     /** The last ring push Stream sent (cid, created_by_id, created_by_display_name): a push ring's call
      *  has no creator loaded when it rings, so the page's caller comes from the push, as on iOS. */
-    private var pushCaller: Triple<String, String, String>? = null
+    @Volatile private var pushCaller: Triple<String, String, String>? = null
+    /** The ringing cid and the caller name it rang with, for the full-screen screen. */
+    @Volatile private var ringName: Pair<String, String>? = null
     /** The cid of Stream's last missed-call push: Stream ends that ring as rejected by this user. */
     private var missedPush: String? = null
     /** The ringing cid this user declined (a call.rejected event from this user, here or on another
@@ -723,8 +725,15 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     fun callIdOf(intent: Intent): String? =
         IntentCompat.getParcelableExtra(intent, NotificationHandler.INTENT_EXTRA_CALL_CID, StreamCallId::class.java)?.cid
 
-    fun callerNameOf(intent: Intent): String? =
-        intent.getStringExtra(NotificationHandler.INTENT_EXTRA_CALL_DISPLAY_NAME)
+    /** The caller's name for the full-screen screen: Stream's intent extra, else the name this ring
+     *  arrived with. Stream's intent for a push ring carries no name (emulator 24 Nov 15:19Z: the Lock
+     *  Screen said "Unknown Caller" while the page was told the caller). */
+    fun callerNameOf(intent: Intent): String? {
+        intent.getStringExtra(NotificationHandler.INTENT_EXTRA_CALL_DISPLAY_NAME)?.ifEmpty { null }?.let { return it }
+        val cid = callIdOf(intent) ?: return null
+        return ringName?.takeIf { it.first == cid }?.second?.ifEmpty { null }
+            ?: pushCaller?.takeIf { it.first == cid }?.third?.ifEmpty { null }
+    }
 
     /** Whether cid's system ring shows now: the full-screen screen shows and answers only such a ring. */
     fun isRinging(cid: String): Boolean = systemRings.showing(cid, SystemClock.elapsedRealtime())
@@ -799,6 +808,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
             if (show) {
                 client?.onRingingCall(StreamCallId(ringing.type, ringing.id), callerName, emptyMap())
             }
+            ringName = ringing.cid to callerName
             CallIntentActivity.ringShown(ringing.cid, callerName)
             emit("incoming", JSONObject().put("call_cid", ringing.cid)
                 .put("caller_id", callerId).put("caller_name", callerName))
