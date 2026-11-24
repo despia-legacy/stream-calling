@@ -734,10 +734,14 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
             if (missedPush == ringing.cid) missedPush = null
             if (declinedRing == ringing.cid) declinedRing = null
             bind(ringing)
-            val by = ringing.state.createdBy.value
+            val by = ringing.state.createdBy.value?.takeIf { it.id.isNotEmpty() }
             val pushed = pushCaller?.takeIf { it.first == ringing.cid }
             val callerId = by?.id ?: pushed?.second ?: ""
             val callerName = by?.userNameOrId ?: pushed?.third?.ifEmpty { null } ?: callerId
+            if (callerId.isEmpty()) {
+                val creator = if (ringing.state.createdBy.value == null) "none" else "blank"
+                log("ring ${ringing.cid}: no caller yet (creator $creator, push ${if (pushCaller == null) "none" else "another cid"})")
+            }
             // Rung over Stream's connection (app running): Stream shows no system ring for that by
             // itself, so it is shown through Stream's own push path, exactly as for an FCM ring.
             val show = systemRings.claim(ringing.cid, SystemClock.elapsedRealtime())
