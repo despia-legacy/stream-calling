@@ -1,4 +1,5 @@
 import AVFAudio
+import CallKit
 import Combine
 import Foundation
 import StreamVideo
@@ -115,6 +116,29 @@ final class StreamCallEngine {
                 }
             }
             .store(in: &subscriptions)
+        c.state.$ringingCall
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] ringing in
+                MainActor.assumeIsolated {
+                    guard let self, self.activeSession === session else { return }
+                    self.ringingChanged(ringing)
+                }
+            }
+            .store(in: &subscriptions)
+    }
+
+    /// A ring that reaches the running app over Stream's connection (`call.ring`) is reported to
+    /// CallKit the same way as a VoIP push, so the app rings in the foreground with or without push.
+    /// Stream sets `ringingCall` for its own outgoing ring (created by this user) and for a call it
+    /// already reported from a push (already the ledger's call): both are left alone. A VoIP push for
+    /// the same call arriving afterwards finds Stream's entry (same UUID) and the ledger's duplicate.
+    private func ringingChanged(_ ringing: Call?) {
+        guard let ringing, let me = credentials?.userId, let by = ringing.state.createdBy, by.id != me,
+              ledger.live?.cid != ringing.cId else { return }
+        let raw: String? = by.name
+        let name = raw.map { $0.isEmpty ? by.id : $0 } ?? by.id
+        reportIncoming(["stream": ["call_cid": ringing.cId, "created_by_id": by.id, "created_by_display_name": name]],
+                       completion: {})
     }
 
     /// Stores the credentials and connects. Replies with the push state; throws a code.
@@ -323,13 +347,32 @@ final class StreamCallEngine {
     /// with no client Stream still reports, then ends the call (`notConfigured`).
     func reportIncoming(_ payload: [AnyHashable: Any], completion: @escaping () -> Void) {
         let push = StreamCallRules.Push(payload)
-        let tracked = push.isCallCid ? ledger.incoming(push.cid) : .error("bad_request")
         let once = StreamCallOnce(completion)
+        guard push.isCallCid, client != nil else { return reportUntracked(push, once) }
+        let tracked = ledger.incoming(push.cid)
         callKit.reportIncomingCall(push.cid, localizedCallerName: push.callerName, callerId: push.callerId,
                                    hasVideo: false) { [weak self] error in
             once.run()
             Task { @MainActor in self?.reported(push, tracked: tracked, error: error) }
         }
+    }
+
+    /// A push with no call cid, or one that arrives with no configured client (after `logout`, or
+    /// before the first `configure`): Stream's service would report it but keep no entry, so nothing
+    /// could end it. It is reported through the same provider (Stream's, the app's one CXProvider)
+    /// and ended as failed inside the report's completion; PushKit's completion runs after both.
+    private func reportUntracked(_ push: StreamCallRules.Push, _ once: StreamCallOnce) {
+        let uuid = UUID()
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .generic, value: push.callerId)
+        update.localizedCallerName = push.callerName
+        update.hasVideo = false
+        let provider = callKit.callProvider
+        provider.reportNewIncomingCall(with: uuid, update: update) { error in
+            if error == nil { provider.reportCall(with: uuid, endedAt: nil, reason: .failed) }
+            once.run()
+        }
+        log(push.isCallCid ? "VoIP push with no configured client: reported and ended" : "VoIP push with no call: reported and ended")
     }
 
     private func reported(_ push: StreamCallRules.Push, tracked: StreamCallLedger.Outcome, error: Error?) {

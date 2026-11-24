@@ -101,6 +101,8 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private var retiringClient: StreamVideo? = null
     private var retiringCredentials: StreamCallCredentials? = null
     private var retiringDevice: Device? = null
+    /** Calls whose system ring (Telecom, full-screen notification, foreground service) is showing. */
+    private val systemRung = mutableSetOf<String>()
 
     fun interface CommandState { fun isActive(): Boolean }
 
@@ -542,6 +544,9 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         // Not configured: there is no client to ring with. Every call type already runs on the
         // audio service with Telecom (registry()), so nothing is registered per push.
         if (client == null) return false
+        // A ring this app already showed from Stream's connection is not shown twice.
+        val cid = extras.getString("call_cid")
+        if (extras.getString("type") == "call.ring" && cid != null && !systemRung.add(cid)) return true
         return FirebaseMessagingDelegate.handleRemoteMessage(RemoteMessage(extras))
     }
 
@@ -583,6 +588,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     fun leave(): StreamCallLedger.Outcome {
         val l = ledger.live() ?: return StreamCallLedger.Outcome.error("no_call")
+        systemRung.remove(l.cid)
         val o = ledger.leave()
         endSdkCall(l)
         unbind()
@@ -687,6 +693,11 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         if (o.isOk) {
             bind(ringing)
             val by = ringing.state.createdBy.value
+            // Rung over Stream's connection (app running): Stream shows no system ring for that by
+            // itself, so it is shown through Stream's own push path, exactly as for an FCM ring.
+            if (systemRung.add(ringing.cid)) {
+                client?.onRingingCall(StreamCallId(ringing.type, ringing.id), by?.userNameOrId ?: "", emptyMap())
+            }
             emit("incoming", JSONObject().put("call_cid", ringing.cid)
                 .put("caller_id", by?.id ?: "").put("caller_name", by?.userNameOrId ?: ""))
         } else if (o.value == "busy") {
@@ -741,6 +752,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     }
 
     private fun endedFromSdk(l: StreamCallLedger.Live, reason: String) {
+        systemRung.remove(l.cid)
         if (!ledger.ended(l.cid, l.epoch, reason).isOk) return
         unbind()
         emit("ended", JSONObject().put("call_cid", l.cid).put("reason", reason))

@@ -4,8 +4,10 @@ import android.Manifest;
 import android.app.Activity;
 import android.app.Application;
 import android.content.Intent;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 
 import androidx.activity.ComponentActivity;
 import androidx.activity.result.ActivityResultLauncher;
@@ -129,6 +131,7 @@ public final class StreamCallExtension implements NativeExtension, StreamCallEng
                             reply.reply(ExtResult.error("timeout", "the permission answer came after the route timed out"));
                             return;
                         }
+                        openFullScreenSettings();
                         reply.reply(ExtResult.ok(permissionState()));
                     });
         } else if (event == ActivityEvent.DESTROYED && registeredOn == a) {
@@ -246,6 +249,7 @@ public final class StreamCallExtension implements NativeExtension, StreamCallEng
             if (!StreamCallPlatform.canNotify(app)) missing.add(Manifest.permission.POST_NOTIFICATIONS);
         }
         if (!request || missing.isEmpty()) {
+            if (request) openFullScreenSettings();
             reply.reply(ExtResult.ok(permissionState()));
             return;
         }
@@ -262,13 +266,32 @@ public final class StreamCallExtension implements NativeExtension, StreamCallEng
         permission.launch(missing.toArray(new String[0]));
     }
 
+    /**
+     * Android 14+: the full-screen ring is a special app access the app cannot request in a dialog.
+     * When it is off, `permissions` with `request` opens the system page for this app
+     * (ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT); the reply reports the state as it is now.
+     */
+    private void openFullScreenSettings() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE || registeredOn == null) return;
+        Application app = (Application) ctx.app();
+        if (StreamCallPlatform.canFullScreen(app)) return;
+        Intent open = new Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                Uri.parse("package:" + app.getPackageName()));
+        try {
+            registeredOn.startActivity(open);
+        } catch (RuntimeException e) {
+            log("the full-screen intent settings page could not be opened");
+        }
+    }
+
     private JSONObject permissionState() {
         Application app = (Application) ctx.app();
         try {
             return new JSONObject()
                     .put("microphone", StreamCallPlatform.micGranted(app) ? "granted" : "denied")
                     .put("bluetooth", StreamCallPlatform.bluetoothGranted(app) ? "granted" : "denied")
-                    .put("notifications", StreamCallPlatform.canNotify(app) ? "granted" : "denied");
+                    .put("notifications", StreamCallPlatform.canNotify(app) ? "granted" : "denied")
+                    .put("full_screen", StreamCallPlatform.canFullScreen(app) ? "granted" : "denied");
         } catch (JSONException e) {
             return new JSONObject();
         }
