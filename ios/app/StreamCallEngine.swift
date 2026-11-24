@@ -590,11 +590,11 @@ final class StreamCallEngine {
         case .typeCallRejectedEvent(let e) where e.callCid == l.cid:
             if l.incoming, l.state == .ringing {
                 endedFromSDK(l, reason: e.user.id == credentials?.userId ? "declined" : "missed")
-            } else if !l.incoming, l.state != .joined {
-                // Ringing an outgoing call: each member's rejection is told with who rejected and
-                // Stream's reason. Once every member but this user has rejected (the session's
-                // rejectedBy), the call ends as "rejected": the same name and shape as on Android,
-                // where Stream's RingingState.RejectedByAll ends it.
+            } else if !l.incoming {
+                // This user's outgoing call, joined as soon as it rings: each member's rejection is
+                // told with who rejected and Stream's reason. Once every member but this user has
+                // rejected (the event's session.rejectedBy), the call ends as "rejected". The same
+                // name, shape and rule as on Android.
                 var info: [String: Any] = ["code": "rejected", "message": "a member declined the call",
                                            "call_cid": l.cid, "user_id": e.user.id]
                 if let reason = e.reason, !reason.isEmpty { info["reason"] = reason }

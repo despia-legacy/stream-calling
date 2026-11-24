@@ -860,7 +860,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         // A member's rejection of this user's outgoing ring, told with who rejected, as on iOS.
         memberRejections = c.subscribeFor(CallRejectedEvent::class.java) { e ->
             val r = e as? CallRejectedEvent
-            if (r != null && r.user.id != credentials?.userId) scope.launch { memberRejected(c.cid, r.user.id, r.reason) }
+            if (r != null && r.user.id != credentials?.userId) scope.launch { memberRejected(c, r) }
         }
         val l = ledger.live() ?: return
         callWatchers = mutableListOf(
@@ -909,16 +909,22 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         else -> "missed"
     }
 
-    /** A member rejected this user's outgoing ring: the page is told who rejected and Stream's reason,
-     *  the same shape as on iOS. The call itself ends as "rejected" once every member has rejected
-     *  (Stream's RingingState.RejectedByAll). */
-    private fun memberRejected(cid: String, userId: String, reason: String?) {
+    /** A member rejected this user's outgoing call (joined as soon as it rings): the page is told who
+     *  rejected and Stream's reason. Once every member but this user has rejected (the event's
+     *  session.rejectedBy), the call ends as "rejected". The same name, shape and rule as on iOS. */
+    private fun memberRejected(c: Call, r: CallRejectedEvent) {
         val l = ledger.live() ?: return
-        if (l.cid != cid || l.incoming || l.state() == StreamCallLedger.JOINED) return
+        if (l.cid != c.cid || l.incoming) return
         val data = JSONObject().put("code", "rejected").put("message", "a member declined the call")
-            .put("call_cid", cid).put("user_id", userId)
-        if (!reason.isNullOrEmpty()) data.put("reason", reason)
+            .put("call_cid", l.cid).put("user_id", r.user.id)
+        if (!r.reason.isNullOrEmpty()) data.put("reason", r.reason)
         emit("error", data)
+        val members = c.state.members.value.map { it.user.id }.toSet() - setOfNotNull(credentials?.userId)
+        val rejected = r.call.session?.rejectedBy?.keys ?: emptySet()
+        if (members.isNotEmpty() && rejected.containsAll(members)) {
+            endSdkCall(l)
+            endedFromSdk(l, "rejected")
+        }
     }
 
     /** Stream's system-UI decline set a new rejectActionBundle on this call during its ring. */
