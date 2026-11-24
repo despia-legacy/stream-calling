@@ -36,6 +36,8 @@ final class StreamCallEngine {
     /// The SDK call object of the live ledger call.
     private var call: Call?
     private var subscriptions = Set<AnyCancellable>()
+    /// Waits for the creator of Stream's ringing call; replaced on every change, ended by a new session.
+    private var pendingRing: AnyCancellable?
     /// The PushKit token as Stream registers it; nil until PushKit gives one.
     private var voipToken: String?
     private var voipInvalidated = false
@@ -94,6 +96,7 @@ final class StreamCallEngine {
 
     private func attach(_ c: StreamVideo, session: TokenSession) {
         subscriptions.removeAll()
+        pendingRing = nil
         client = c
         if !callKitPrepared {
             callKitPrepared = true
@@ -133,7 +136,7 @@ final class StreamCallEngine {
             .sink { [weak self] ringing in
                 MainActor.assumeIsolated {
                     guard let self, self.activeSession === session else { return }
-                    self.ringingChanged(ringing)
+                    self.ringingChanged(ringing, session: session)
                 }
             }
             .store(in: &subscriptions)
@@ -144,9 +147,36 @@ final class StreamCallEngine {
     /// Stream sets `ringingCall` for its own outgoing ring (created by this user) and for a call it
     /// already reported from a push (already the ledger's call): both are left alone. A VoIP push for
     /// the same call arriving afterwards finds Stream's entry (same UUID) and the ledger's duplicate.
-    private func ringingChanged(_ ringing: Call?) {
-        guard let ringing, let me = credentials?.userId, let by = ringing.state.createdBy, by.id != me,
-              ledger.live?.cid != ringing.cId else { return }
+    /// The creator can arrive after `ringingCall` (Android 1.35.0 orders it so): the ring is taken at the
+    /// first creator, while it is still Stream's ringing call in the same session, for at most
+    /// `ringWait` seconds; every change of `ringingCall` replaces the wait.
+    private func ringingChanged(_ ringing: Call?, session: TokenSession) {
+        pendingRing = nil
+        guard let ringing else { return }
+        pendingRing = ringing.state.$createdBy
+            .compactMap { $0 }
+            .first()
+            .timeout(.seconds(Self.ringWait), scheduler: DispatchQueue.main)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] by in
+                MainActor.assumeIsolated {
+                    guard let self, self.activeSession === session,
+                          self.client?.state.ringingCall?.cId == ringing.cId else { return }
+                    self.connectionRing(ringing, by: by)
+                }
+            }
+    }
+
+    private static let ringWait = 60
+
+    /// A connection ring carries no Apple reporting duty: during a live call it is declined as busy
+    /// without CallKit. (A VoIP push for it is still reported first, then declined in `reported`.)
+    private func connectionRing(_ ringing: Call, by: User) {
+        guard let me = credentials?.userId, by.id != me, ledger.live?.cid != ringing.cId else { return }
+        if ledger.live != nil {
+            Task { _ = try? await ringing.reject(reason: "busy") }
+            return
+        }
         let raw: String? = by.name
         let name = raw.map { $0.isEmpty ? by.id : $0 } ?? by.id
         reportIncoming(["stream": ["call_cid": ringing.cId, "created_by_id": by.id, "created_by_display_name": name]],

@@ -704,10 +704,11 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         // Stream sets ringingCall on call.ring before that call has handled the event, so its ringing
         // state can still be Idle here (ClientState.handleEvent, then CallState.updateRingingState,
         // 1.35.0). The ring is taken when the state leaves Idle, if it is Incoming and the call is
-        // still Stream's ringing call in the same session; an outgoing ring (ours) is left alone.
+        // still Stream's ringing call in the same session; an outgoing ring (ours) is left alone. The
+        // wait ends at the next ringingCall change, a new session, or RING_WAIT_MS.
         val session = activeSession
         pendingRing = scope.launch {
-            val state = ringing.state.ringingState.first { it !is RingingState.Idle }
+            val state = withTimeoutOrNull(RING_WAIT_MS) { ringing.state.ringingState.first { it !is RingingState.Idle } }
             if (state is RingingState.Incoming && streamRinging == ringing.cid && activeSession === session) incomingRing(ringing)
         }
     }
@@ -802,5 +803,6 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     private companion object {
         const val NO_TOKEN = ""
+        const val RING_WAIT_MS = 60_000L
     }
 }
