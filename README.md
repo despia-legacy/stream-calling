@@ -75,6 +75,7 @@ This extension adds audio calls through Stream Video. Your page configures the c
 
 - **iOS:** CallKit and a VoIP push (the system call screen, Lock Screen, Bluetooth and CarPlay routing).
 - **Android:** a self-managed Telecom call with Stream's call notification and a full-screen ring.
+- **App open:** a ring that reaches the running app over Stream's connection rings the same system call screen, with or without push. A push for the same call that arrives afterwards does not ring twice.
 
 ---
 
@@ -180,7 +181,7 @@ When the token expires, the app first asks the `token_url` you configured (this 
 | `configure`   | `api_key`, `user_id`, `token` (required), `user_name`, `token_url` (https, an approved host), `voip_provider`, `fcm_provider` | `user_id`, `push` (the push registration state) | `streamcallConfigure` | `onStreamcallConfigure` |
 | `set_token`   | `token` (required), `request_id` (from `token_needed`, recommended)                                                                                      | An empty object | `streamcallSetToken` | `onStreamcallSetToken` |
 | `logout`      | none                                                                                                    | An empty object | `streamcallLogout` | `onStreamcallLogout` |
-| `permissions` | `request` (bool)                                                                                        | `microphone`, `notifications` | `streamcallPermissions` | `onStreamcallPermissions` |
+| `permissions` | `request` (bool)                                                                                        | `microphone`, `notifications`; on Android also `bluetooth` and `full_screen` | `streamcallPermissions` | `onStreamcallPermissions` |
 | `join`        | `call_type` (required, for example `audio_call`), `call_id` (required), `create`, `ring`, `members` (comma-separated user ids; `ring` needs at least one) | `state: "connecting"` and the call | `streamcallJoin` | `onStreamcallJoin` |
 | `leave`       | none                                                                                                    | `call_cid`, `state: "ended"` | `streamcallLeave` | `onStreamcallLeave` |
 | `set_muted`   | `muted` (bool, required)                                                                                | `muted`, `call_cid` | `streamcallSetMuted` | `onStreamcallSetMuted` |
@@ -204,9 +205,23 @@ Every event carries `call_cid` and a growing `seq`.
 | `error`        | `onStreamcallError`         | `app` |
 | `token_needed` | `onStreamcallTokenNeeded`   | `app` |
 
+### End reasons
+
+`ended` carries one of these reasons, the same on iOS and Android:
+
+- `declined`: this user declined the ring, on this device or another one.
+- `answered_elsewhere`: this user answered the ring on another device or session.
+- `missed`: the ring ended unanswered here. The caller hung up or rejected it, or it timed out. This is the `call.missed` event Stream sends the callee.
+- `rejected`: every member rejected this user's outgoing ring.
+- `remote`: the other side ended a joined call.
+- `local`: this side left a joined call, in the app or in the system call UI.
+- `failed`, `logout`, `token_expired`.
+
+While an outgoing call rings, each member who rejects it sends `error` with the code `rejected`. The event carries `user_id` (who rejected) and, when Stream gives one, `reason`.
+
 ### Error codes
 
-Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a join while the recorder sample records), `permission_denied`, `connect_failed`, `storage_failed`, `bad_token`, `token_request_expired` (a refresh request is no longer pending), `session_changed` (configure was superseded by logout or another configure) and, for a failed audio route change, `route_failed`.
+Besides the standard codes: `rejected` (a member rejected this user's outgoing ring), `not_configured`, `busy`, `no_call`, `audio_busy` (a join while the recorder sample records), `permission_denied`, `connect_failed`, `storage_failed`, `bad_token`, `token_request_expired` (a refresh request is no longer pending), `session_changed` (configure was superseded by logout or another configure) and, for a failed audio route change, `route_failed`.
 
 ---
 
@@ -216,7 +231,8 @@ Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a
 
 - **Microphone.** `NSMicrophoneUsageDescription`, under `requires.usage_descriptions`.
 - **Background mode.** `audio`.
-- **VoIP.** The manifest claims the app's one VoIP owner (`claims.voip`). Stream's CallKit service handles the system call screen. The extension never creates a second PushKit registry.
+- **VoIP.** The manifest claims the app's one VoIP owner (`claims.voip`). PushKit is registered at app launch, so a push can wake a closed app. Stream's CallKit service handles the system call screen. The extension never creates a second PushKit registry.
+- **Every push rings or ends.** Each VoIP push is reported to CallKit before PushKit's completion runs. A push with no call in it, or one that arrives while no user is configured (after `logout`), is reported and ended at once, so nothing rings as an unknown caller.
 - **Audio.** The extension never configures the audio session. Stream and the system do.
 
 ### Android
@@ -224,6 +240,7 @@ Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a
 - **Permissions.** `RECORD_AUDIO` and `BLUETOOTH_CONNECT`, under `requires.permissions`, and the restricted `USE_FULL_SCREEN_INTENT` for the Lock Screen ring.
 - **Push.** Your app keeps its one Firebase messaging service. `StreamPushReceiver` hands only Stream's messages to Stream.
 - **Call screen.** `CallIntentActivity`, opened by Stream's call notification, with Answer and Decline on the Lock Screen.
+- **Full-screen ring (Android 14 and later).** The user can turn the full-screen permission off for an app, and Google Play grants it by default only to calling apps. `permissions` reports it as `full_screen`. With `request: true` and the permission off, it opens the system page where the user turns it back on. Without it, the call still rings as a heads-up notification.
 - **Removed pieces.** The module manifest removes Stream's camera, screen-share and livestream pieces.
 - **Exported components.** The push receiver, and Android Telecom's connection service and mute receiver, recorded in the capability policy and verified against the built artifact.
 
@@ -231,7 +248,8 @@ Besides the standard codes: `not_configured`, `busy`, `no_call`, `audio_busy` (a
 
 ## Platform limits
 
-- **One VoIP owner.** With the built-in Stream option on, the build refuses this template.
+- **One VoIP owner.** The app has one PushKit owner, this extension. The build refuses it next to base-app code that registers PushKit itself.
+- **China.** An app with this extension links PushKit and CallKit. Remove China from the app's available territories in App Store Connect.
 - **Android dependencies.** Use the Maven repository and exact dependencies declared in `manifest.json` and `android/streamcall/build.gradle`.
 - Account switching is experimental. Verify push-device registrations in your Stream project when changing users.
 - Background ringing and Lock Screen answering remain preview features.

@@ -2,8 +2,11 @@ package despia.ext.streamcall;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Pure rules shared by the extension and the engine, the Java twin of ios/app/StreamCallRules.swift.
@@ -80,6 +83,66 @@ public final class StreamCallRules {
                 && firebaseKey != null && firebaseKey.equals(deviceProvider)
                 && providerName != null && providerName.equals(deviceProviderName);
         return same ? "registered" : "pending";
+    }
+
+    /**
+     * The calls whose system ring (Telecom, full-screen notification, phone-call service) this
+     * process has shown and that still ring. Stream can deliver one ring twice, over its connection
+     * and by FCM, and it is shown once. A cid rings again as soon as its ring is over: the page or
+     * Stream ended the call, it was refused as busy, or Stream stopped ringing it. A push handed to
+     * Stream that Stream never made its ringing call (its ring service did not start, or the call
+     * was already over) stops counting after HANDOFF_MS. Thread-safe: FCM and Stream's state
+     * collectors call it from different threads.
+     */
+    public static final class SystemRings {
+        /** How long a push hand-off counts before Stream's ringing call takes it over. */
+        public static final long HANDOFF_MS = 30_000L;
+        private final Map<String, Long> handedOff = new HashMap<>();
+        private final Set<String> ringing = new HashSet<>();
+        private Listener listener;
+
+        /** Told, outside the lock, each cid whose ring is over. */
+        public interface Listener { void ringOver(String cid); }
+
+        public synchronized void listen(Listener l) {
+            listener = l;
+        }
+
+        /** True: show cid's system ring now (it is recorded as handed to Stream); false: it already shows. */
+        public synchronized boolean claim(String cid, long nowMs) {
+            if (cid == null) return true;
+            if (ringing.contains(cid)) return false;
+            Long at = handedOff.get(cid);
+            if (at != null && nowMs >= at && nowMs - at < HANDOFF_MS) return false;
+            handedOff.put(cid, nowMs);
+            return true;
+        }
+
+        /** Stream's ringing call is cid: its system ring shows until release(cid). */
+        public synchronized void ringing(String cid) {
+            if (cid == null) return;
+            handedOff.remove(cid);
+            ringing.add(cid);
+        }
+
+        /** Whether cid's system ring shows now: Stream rings it, or its push hand-off still counts. */
+        public synchronized boolean showing(String cid, long nowMs) {
+            if (cid == null) return false;
+            if (ringing.contains(cid)) return true;
+            Long at = handedOff.get(cid);
+            return at != null && nowMs >= at && nowMs < at + HANDOFF_MS;
+        }
+
+        /** cid's ring is over; the next ring for it is shown, and the listener is told. */
+        public void release(String cid) {
+            Listener l;
+            synchronized (this) {
+                handedOff.remove(cid);
+                ringing.remove(cid);
+                l = listener;
+            }
+            if (l != null && cid != null) l.ringOver(cid);
+        }
     }
 
     /** The message that goes with one of the template's error codes. */

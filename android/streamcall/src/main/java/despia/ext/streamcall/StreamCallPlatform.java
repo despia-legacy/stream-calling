@@ -1,6 +1,7 @@
 package despia.ext.streamcall;
 
 import android.Manifest;
+import android.app.NotificationManager;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.media.AudioManager;
@@ -26,6 +27,17 @@ final class StreamCallPlatform {
     /** POST_NOTIFICATIONS exists from API 33; the ring notification needs it there. */
     static boolean canNotify(Context c) {
         return NotificationManagerCompat.from(c).areNotificationsEnabled();
+    }
+
+    /**
+     * Whether the ring may show full screen over the lock screen. From API 34 the user (or Play, for
+     * apps not declared as calling apps) can turn USE_FULL_SCREEN_INTENT off; below it the manifest
+     * permission is enough.
+     */
+    static boolean canFullScreen(Context c) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) return true;
+        NotificationManager nm = c.getSystemService(NotificationManager.class);
+        return nm != null && nm.canUseFullScreenIntent();
     }
 
     /**

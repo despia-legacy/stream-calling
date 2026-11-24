@@ -1,4 +1,5 @@
 import AVFAudio
+import CallKit
 import Combine
 import Foundation
 import StreamVideo
@@ -12,7 +13,12 @@ import StreamVideo
 ///   `registerForIncomingCalls`, which would create Stream's own second registry.
 /// - CallKit: Stream's `CallKitService` is the app's one CXProvider. The template gives it the
 ///   client and reports each push through it, so CallKit's audio activation reaches Stream's audio
-///   stack through Stream's own delegate.
+///   stack through Stream's own delegate. Stream's service cannot be created before a `StreamVideo`
+///   exists in the process (its init reads the injected client and stops the app without one), so
+///   nothing here touches `callKit` or `callKitAdapter` until `build` has made one (`streamBuilt`).
+///   A VoIP push that arrives before that (a launch with no stored user) is reported through a
+///   one-shot provider that is invalidated as soon as the call is ended, so there is still only
+///   one provider in use at any time.
 /// - Audio session: the template never configures, activates or deactivates it. CallKit and Stream
 ///   do; the template only reads it (release only what you activated, and this file activates
 ///   nothing).
@@ -30,6 +36,8 @@ final class StreamCallEngine {
     /// The SDK call object of the live ledger call.
     private var call: Call?
     private var subscriptions = Set<AnyCancellable>()
+    /// Waits for the creator of Stream's ringing call; replaced on every change, ended by a new session.
+    private var pendingRing: AnyCancellable?
     /// The PushKit token as Stream registers it; nil until PushKit gives one.
     private var voipToken: String?
     private var voipInvalidated = false
@@ -43,6 +51,9 @@ final class StreamCallEngine {
     private var activeSession: TokenSession?
     private var candidateSession: TokenSession?
     private var routeObserver: NSObjectProtocol?
+    /// True once a `StreamVideo` exists in this process; only then can Stream's CallKit service exist.
+    private var streamBuilt = false
+    private var callKitPrepared = false
 
     @Injected(\.callKitService) private var callKit
     /// Used only for its `callSettings` (audio on, video off) and the CallKit appearance; its
@@ -54,8 +65,6 @@ final class StreamCallEngine {
     /// Process start, including a background launch for a VoIP push: rebuild the client from what
     /// `configure` stored, so the push that woke the app can be reported and answered.
     func restore() {
-        callKitAdapter.callSettings = CallSettings(audioOn: true, videoOn: false, speakerOn: false)
-        callKit.supportsVideo = false
         routeObserver = NotificationCenter.default.addObserver(forName: AVAudioSession.routeChangeNotification,
                                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.routeChanged() }
@@ -70,6 +79,7 @@ final class StreamCallEngine {
 
     private func build(_ session: TokenSession) -> StreamVideo {
         let c = session.credentials
+        defer { streamBuilt = true }
         return StreamVideo(apiKey: c.apiKey,
                     user: User(id: c.userId, name: c.userName),
                     token: UserToken(rawValue: c.token),
@@ -86,7 +96,13 @@ final class StreamCallEngine {
 
     private func attach(_ c: StreamVideo, session: TokenSession) {
         subscriptions.removeAll()
+        pendingRing = nil
         client = c
+        if !callKitPrepared {
+            callKitPrepared = true
+            callKitAdapter.callSettings = CallSettings(audioOn: true, videoOn: false, speakerOn: false)
+            callKit.supportsVideo = false
+        }
         callKit.streamVideo = c
         c.eventPublisher()
             .receive(on: DispatchQueue.main)
@@ -115,6 +131,56 @@ final class StreamCallEngine {
                 }
             }
             .store(in: &subscriptions)
+        c.state.$ringingCall
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] ringing in
+                MainActor.assumeIsolated {
+                    guard let self, self.activeSession === session else { return }
+                    self.ringingChanged(ringing, session: session)
+                }
+            }
+            .store(in: &subscriptions)
+    }
+
+    /// A ring that reaches the running app over Stream's connection (`call.ring`) is reported to
+    /// CallKit the same way as a VoIP push, so the app rings in the foreground with or without push.
+    /// Stream sets `ringingCall` for its own outgoing ring (created by this user) and for a call it
+    /// already reported from a push (already the ledger's call): both are left alone. A VoIP push for
+    /// the same call arriving afterwards finds Stream's entry (same UUID) and the ledger's duplicate.
+    /// The creator can arrive after `ringingCall` (Android 1.35.0 orders it so): the ring is taken at the
+    /// first creator, while it is still Stream's ringing call in the same session, for at most
+    /// `ringWait` seconds; every change of `ringingCall` replaces the wait.
+    private func ringingChanged(_ ringing: Call?, session: TokenSession) {
+        pendingRing = nil
+        guard let ringing else { return }
+        pendingRing = ringing.state.$createdBy
+            .compactMap { $0 }
+            .first()
+            .timeout(.seconds(Self.ringWait), scheduler: DispatchQueue.main)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] by in
+                MainActor.assumeIsolated {
+                    guard let self, self.activeSession === session,
+                          self.client?.state.ringingCall?.cId == ringing.cId else { return }
+                    self.connectionRing(ringing, by: by)
+                }
+            }
+    }
+
+    private static let ringWait = 60
+
+    /// A connection ring carries no Apple reporting duty: during a live call it is declined as busy
+    /// without CallKit. (A VoIP push for it is still reported first, then declined in `reported`.)
+    private func connectionRing(_ ringing: Call, by: User) {
+        guard let me = credentials?.userId, by.id != me, ledger.live?.cid != ringing.cId else { return }
+        if ledger.live != nil {
+            Task { _ = try? await ringing.reject(reason: "busy") }
+            return
+        }
+        let raw: String? = by.name
+        let name = raw.map { $0.isEmpty ? by.id : $0 } ?? by.id
+        reportIncoming(["stream": ["call_cid": ringing.cId, "created_by_id": by.id, "created_by_display_name": name]],
+                       completion: {})
     }
 
     /// Stores the credentials and connects. Replies with the push state; throws a code.
@@ -232,7 +298,7 @@ final class StreamCallEngine {
         subscriptions.removeAll()
         let c = client
         client = nil
-        callKit.streamVideo = nil
+        if streamBuilt { callKit.streamVideo = nil }
         let registered = credentials?.registeredVoipToken
         credentials = nil
         StreamCallKeychain.delete()
@@ -323,8 +389,9 @@ final class StreamCallEngine {
     /// with no client Stream still reports, then ends the call (`notConfigured`).
     func reportIncoming(_ payload: [AnyHashable: Any], completion: @escaping () -> Void) {
         let push = StreamCallRules.Push(payload)
-        let tracked = push.isCallCid ? ledger.incoming(push.cid) : .error("bad_request")
         let once = StreamCallOnce(completion)
+        guard push.isCallCid, client != nil else { return reportUntracked(push, once) }
+        let tracked = ledger.incoming(push.cid)
         callKit.reportIncomingCall(push.cid, localizedCallerName: push.callerName, callerId: push.callerId,
                                    hasVideo: false) { [weak self] error in
             once.run()
@@ -332,11 +399,35 @@ final class StreamCallEngine {
         }
     }
 
+    /// A push with no call cid, or one that arrives with no configured client (after `logout`, or
+    /// before the first `configure`): Stream's service would report it but keep no entry, so nothing
+    /// could end it. It is reported through Stream's provider when a client was built in this
+    /// process, else through a one-shot provider (Stream's service cannot exist yet), ended as failed
+    /// inside the report's completion, and the one-shot provider is invalidated; PushKit's completion
+    /// runs after both.
+    private func reportUntracked(_ push: StreamCallRules.Push, _ once: StreamCallOnce) {
+        let uuid = UUID()
+        let update = CXCallUpdate()
+        update.remoteHandle = CXHandle(type: .generic, value: push.callerId)
+        update.localizedCallerName = push.callerName
+        update.hasVideo = false
+        let oneShot = !streamBuilt
+        let provider = oneShot ? CXProvider(configuration: CXProviderConfiguration()) : callKit.callProvider
+        provider.reportNewIncomingCall(with: uuid, update: update) { error in
+            if error == nil { provider.reportCall(with: uuid, endedAt: nil, reason: .failed) }
+            if oneShot { provider.invalidate() }
+            once.run()
+        }
+        log(push.isCallCid ? "VoIP push with no configured client: reported and ended" : "VoIP push with no call: reported and ended")
+    }
+
     private func reported(_ push: StreamCallRules.Push, tracked: StreamCallLedger.Outcome, error: Error?) {
         switch tracked {
         case .ok:
             guard let l = ledger.live, l.cid == push.cid else { return }
-            if error != nil {
+            if let error = error as NSError? {
+                // CXErrorCodeIncomingCallError (filtered by Do Not Disturb or the block list, unentitled, ...).
+                log("CallKit did not report the incoming call: \(error.domain) \(error.code)")
                 endedFromSDK(l, reason: "failed")
                 return
             }
@@ -378,6 +469,8 @@ final class StreamCallEngine {
                 _ = try await sdkCall.join(create: create, options: options, ring: ring)
                 self.joinFinished(l, sdkCall)
             } catch {
+                let e = error as NSError
+                self.log("join \(cid) failed: \(e.domain) \(e.code) \(e.localizedDescription)")
                 self.endedFromSDK(l, reason: "failed")
             }
         }
@@ -490,17 +583,28 @@ final class StreamCallEngine {
         guard let l = ledger.live else { return }
         switch event {
         case .typeCallEndedEvent(let e) where e.callCid == l.cid:
-            endedFromSDK(l, reason: l.state == .ringing && l.incoming ? "cancelled" : "remote")
+            endedFromSDK(l, reason: l.state == .ringing && l.incoming ? "missed" : "remote")
         case .typeCallAcceptedEvent(let e) where e.callCid == l.cid && l.incoming && l.state == .ringing
             && e.user.id == credentials?.userId:
             endedFromSDK(l, reason: "answered_elsewhere")
         case .typeCallRejectedEvent(let e) where e.callCid == l.cid:
             if l.incoming, l.state == .ringing {
-                endedFromSDK(l, reason: e.user.id == credentials?.userId ? "declined" : "cancelled")
-            } else if !l.incoming, l.state != .joined {
-                // Ringing an outgoing call: every rejection is a member's; the caller stays until
-                // the SDK ends the call or the page leaves.
-                emit("error", ["code": "rejected", "message": "a member declined the call", "call_cid": l.cid])
+                endedFromSDK(l, reason: e.user.id == credentials?.userId ? "declined" : "missed")
+            } else if !l.incoming {
+                // This user's outgoing call, joined as soon as it rings: each member's rejection is
+                // told with who rejected and Stream's reason. Once every member but this user has
+                // rejected (the event's session.rejectedBy), the call ends as "rejected". The same
+                // name, shape and rule as on Android.
+                var info: [String: Any] = ["code": "rejected", "message": "a member declined the call",
+                                           "call_cid": l.cid, "user_id": e.user.id]
+                if let reason = e.reason, !reason.isEmpty { info["reason"] = reason }
+                emit("error", info)
+                let members = Set((call?.state.members ?? []).map(\.id)).subtracting([credentials?.userId ?? ""])
+                let rejected = Set((e.call.session?.rejectedBy ?? [:]).keys)
+                if !members.isEmpty, members.isSubset(of: rejected) {
+                    endSDKCall(l)
+                    endedFromSDK(l, reason: "rejected")
+                }
             }
         case .typeCallMissedEvent(let e) where e.callCid == l.cid && l.incoming:
             endedFromSDK(l, reason: "missed")

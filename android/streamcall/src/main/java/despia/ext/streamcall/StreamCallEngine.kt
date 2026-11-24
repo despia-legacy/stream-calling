@@ -1,8 +1,11 @@
 package despia.ext.streamcall
 
 import android.app.Application
+import android.app.Notification
+import android.app.NotificationManager
 import android.content.Intent
 import android.os.Bundle
+import android.os.SystemClock
 import androidx.core.content.IntentCompat
 import com.google.firebase.FirebaseApp
 import com.google.firebase.messaging.FirebaseMessaging
@@ -12,9 +15,13 @@ import io.getstream.android.push.PushDevice
 import io.getstream.android.push.PushProvider
 import io.getstream.android.push.firebase.FirebaseMessagingDelegate
 import io.getstream.android.push.firebase.FirebasePushDeviceGenerator
+import io.getstream.android.video.generated.models.CallAcceptedEvent
+import io.getstream.android.video.generated.models.CallMissedEvent
+import io.getstream.android.video.generated.models.CallRejectedEvent
 import io.getstream.result.Result
 import io.getstream.video.android.core.Call
 import io.getstream.video.android.core.CreateCallOptions
+import io.getstream.video.android.core.EventSubscription
 import io.getstream.video.android.core.GEO
 import io.getstream.video.android.core.RealtimeConnection
 import io.getstream.video.android.core.RingingState
@@ -34,6 +41,7 @@ import io.getstream.video.android.model.User
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -45,6 +53,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -92,6 +101,32 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         val waiters = mutableMapOf<String, CompletableDeferred<String?>>()
     }
     private var activeSession: TokenSession? = null
+    /** The last ring push Stream sent (cid, created_by_id, created_by_display_name): a push ring's call
+     *  has no creator loaded when it rings, so the page's caller comes from the push, as on iOS. */
+    @Volatile private var pushCaller: Triple<String, String, String>? = null
+    /** The ringing cid and the caller name it rang with, for the full-screen screen. */
+    @Volatile private var ringName: Pair<String, String>? = null
+    /** The cid of Stream's last missed-call push: Stream ends that ring as rejected by this user. */
+    private var missedPush: String? = null
+    /** The ringing cid this user declined (a call.rejected event from this user, here or on another
+     *  device). Stream's rejectedBy cannot tell: it keeps an earlier ring's refusal of the same cid. */
+    @Volatile private var declinedRing: String? = null
+    /** The ringing cid Stream's own ring timer rejected for this user ("timeout"): a missed ring. */
+    @Volatile private var timedOutRing: String? = null
+    /** The ringing cid Stream sent this user call.missed for over its connection. */
+    @Volatile private var missedRing: String? = null
+    /** The ringing cid this user accepted on another device or session. Stream's CallState leaves a
+     *  ringing call that this user accepted elsewhere (a call.accepted event from this user that this
+     *  device did not accept); iOS names that end "answered_elsewhere". */
+    @Volatile private var acceptedElsewhere: String? = null
+    private var rejections: EventSubscription? = null
+    private var missedEvents: EventSubscription? = null
+    private var memberRejections: EventSubscription? = null
+    private var accepts: EventSubscription? = null
+    /** The ringing cid and its rejectActionBundle when the ring was taken. Stream's system-UI decline
+     *  (notification, Lock Screen, wearable) sets a new bundle, and no call.rejected echo arrives while
+     *  the app is in the background. */
+    private var ringBundle: Pair<String, Bundle?>? = null
     private var candidateSession: TokenSession? = null
     private var candidateClient: StreamVideo? = null
     private var configuration = 0L
@@ -101,11 +136,21 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private var retiringClient: StreamVideo? = null
     private var retiringCredentials: StreamCallCredentials? = null
     private var retiringDevice: Device? = null
+    /** Calls whose system ring (Telecom, full-screen notification, foreground service) is showing. A
+     *  full-screen screen still showing a ring that is over closes. */
+    private val systemRings = StreamCallRules.SystemRings().apply {
+        listen { cid -> scope.launch(Dispatchers.Main.immediate) { CallIntentActivity.ringOver(cid) } }
+    }
+    /** The cid of Stream's ringing call as last seen, so a ring that stops is released. */
+    private var streamRinging: String? = null
+    /** Waits for Stream's ringing call to report its ringing state; replaced on every change. */
+    private var pendingRing: Job? = null
 
     fun interface CommandState { fun isActive(): Boolean }
 
     /** Application.onCreate (also when FCM starts the process): rebuild the client from storage. */
     fun restore() {
+        clearLeftRings()
         val stored = StreamCallCredentials.load(host.dataDir()) ?: return
         credentials = stored
         val session = TokenSession(stored)
@@ -114,6 +159,15 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         attach(c, session)
         ledger.configure()
         scope.launch { registerPush(c, session) }
+    }
+
+    /** A new process holds no ring and no call yet, so a call notification still posted was left by a
+     *  process that ended while it rang (emulator 24 Nov 14:38Z: a killed app's ring stayed, its
+     *  full-screen screen came back and covered the next ring). Its call is over here: it is cleared. */
+    private fun clearLeftRings() {
+        val nm = app.getSystemService(NotificationManager::class.java) ?: return
+        nm.activeNotifications.filter { it.notification.category == Notification.CATEGORY_CALL }
+            .forEach { nm.cancel(it.tag, it.id) }
     }
 
     private fun hasFirebase(): Boolean = FirebaseApp.getApps(app).isNotEmpty()
@@ -193,6 +247,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     private fun attach(c: StreamVideo, session: TokenSession) {
         watchers.forEach { it.cancel() }
+        pendingRing?.cancel()
         watchers = mutableListOf(
             scope.launch { c.state.ringingCall.collect { ringing -> if (activeSession === session) ringingChanged(ringing) } },
             scope.launch { c.state.activeCall.collect { active -> if (activeSession === session) activeChanged(active) } },
@@ -542,7 +597,32 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         // Not configured: there is no client to ring with. Every call type already runs on the
         // audio service with Telecom (registry()), so nothing is registered per push.
         if (client == null) return false
-        return FirebaseMessagingDelegate.handleRemoteMessage(RemoteMessage(extras))
+        // A ring this app already showed from Stream's connection is not shown twice.
+        val cid = extras.getString("call_cid")
+        if (cid != null && extras.getString("type") == "call.ring") {
+            pushCaller = Triple(cid, extras.getString("created_by_id") ?: "", extras.getString("created_by_display_name") ?: "")
+        }
+        if (cid != null && extras.getString("type") == "call.missed") missedPush = cid
+        if (extras.getString("type") == "call.ring" && cid != null && !systemRings.claim(cid, SystemClock.elapsedRealtime())) return true
+        val handled = FirebaseMessagingDelegate.handleRemoteMessage(RemoteMessage(extras))
+        if (handled && cid != null && extras.getString("type") == "call.ring") {
+            // A push arrives off the main thread; the full-screen screen is the main thread's.
+            val name = extras.getString("created_by_display_name")?.ifEmpty { null }
+            scope.launch { CallIntentActivity.ringShown(cid, name) }
+            load(cid)
+        }
+        return handled
+    }
+
+    /** Stream shows a push ring before it loads the call (Android17IncomingCallCoordinator, 1.35.0):
+     *  without the call's ring settings its ring timer has no timeout, and an end that happened while
+     *  the app was not connected is never applied, so on a cold start the ring stayed after its
+     *  caller ended it (emulator 24 Nov 14:37Z). Loading the call starts Stream's own ring timer and
+     *  applies the call's state. */
+    private fun load(cid: String) {
+        val c = client ?: return
+        val type = StreamCallRules.callType(cid) ?: return
+        scope.launch { c.call(type, StreamCallRules.callId(cid)).get() }
     }
 
     // ---------------------------------------------------------------- page commands
@@ -583,6 +663,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     fun leave(): StreamCallLedger.Outcome {
         val l = ledger.live() ?: return StreamCallLedger.Outcome.error("no_call")
+        systemRings.release(l.cid)
         val o = ledger.leave()
         endSdkCall(l)
         unbind()
@@ -651,8 +732,18 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     fun callIdOf(intent: Intent): String? =
         IntentCompat.getParcelableExtra(intent, NotificationHandler.INTENT_EXTRA_CALL_CID, StreamCallId::class.java)?.cid
 
-    fun callerNameOf(intent: Intent): String? =
-        intent.getStringExtra(NotificationHandler.INTENT_EXTRA_CALL_DISPLAY_NAME)
+    /** The caller's name for the full-screen screen: Stream's intent extra, else the name this ring
+     *  arrived with. Stream's intent for a push ring carries no name (emulator 24 Nov 15:19Z: the Lock
+     *  Screen said "Unknown Caller" while the page was told the caller). */
+    fun callerNameOf(intent: Intent): String? {
+        intent.getStringExtra(NotificationHandler.INTENT_EXTRA_CALL_DISPLAY_NAME)?.ifEmpty { null }?.let { return it }
+        val cid = callIdOf(intent) ?: return null
+        return ringName?.takeIf { it.first == cid }?.second?.ifEmpty { null }
+            ?: pushCaller?.takeIf { it.first == cid }?.third?.ifEmpty { null }
+    }
+
+    /** Whether cid's system ring shows now: the full-screen screen shows and answers only such a ring. */
+    fun isRinging(cid: String): Boolean = systemRings.showing(cid, SystemClock.elapsedRealtime())
 
     /** Answer in the system UI (notification Accept, full-screen Answer): accept, then join. */
     fun answer(cid: String) {
@@ -680,31 +771,97 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     // ---------------------------------------------------------------- SDK state
 
     private fun ringingChanged(ringing: Call?) {
+        // Stream stopped ringing a call this page does not hold (declined elsewhere, missed, or a ring
+        // for a call already over): its system ring is gone, so the same cid rings again next time.
+        pendingRing?.cancel()
+        pendingRing = null
+        val before = streamRinging
+        streamRinging = ringing?.cid
+        if (before != null && before != streamRinging && before != ledger.live()?.cid) systemRings.release(before)
         if (ringing == null) return
-        val state = ringing.state.ringingState.value
-        if (state !is RingingState.Incoming) return
+        // Stream sets ringingCall on call.ring before that call has handled the event, so its ringing
+        // state can still be Idle here (ClientState.handleEvent, then CallState.updateRingingState,
+        // 1.35.0). The ring is taken when the state leaves Idle, if it is Incoming and the call is
+        // still Stream's ringing call in the same session; an outgoing ring (ours) is left alone. The
+        // wait ends at the next ringingCall change, a new session, or RING_WAIT_MS.
+        val session = activeSession
+        pendingRing = scope.launch {
+            val state = withTimeoutOrNull(RING_WAIT_MS) { ringing.state.ringingState.first { it !is RingingState.Idle } }
+            if (state is RingingState.Incoming && streamRinging == ringing.cid && activeSession === session) incomingRing(ringing)
+        }
+    }
+
+    private fun incomingRing(ringing: Call) {
         val o = ledger.incoming(ringing.cid)
         if (o.isOk) {
+            if (missedPush == ringing.cid) missedPush = null
+            if (acceptedElsewhere == ringing.cid) acceptedElsewhere = null
+            if (declinedRing == ringing.cid) declinedRing = null
+            if (timedOutRing == ringing.cid) timedOutRing = null
+            if (missedRing == ringing.cid) missedRing = null
+            ringBundle = ringing.cid to ringing.state.rejectActionBundle.value
             bind(ringing)
-            val by = ringing.state.createdBy.value
+            val by = ringing.state.createdBy.value?.takeIf { it.id.isNotEmpty() }
+            val pushed = pushCaller?.takeIf { it.first == ringing.cid }
+            val callerId = by?.id ?: pushed?.second ?: ""
+            val callerName = by?.userNameOrId ?: pushed?.third?.ifEmpty { null } ?: callerId
+            if (callerId.isEmpty()) {
+                val creator = if (ringing.state.createdBy.value == null) "none" else "blank"
+                log("ring ${ringing.cid}: no caller yet (creator $creator, push ${pushCaller?.first ?: "none"})")
+            }
+            // Rung over Stream's connection (app running): Stream shows no system ring for that by
+            // itself, so it is shown through Stream's own push path, exactly as for an FCM ring.
+            val show = systemRings.claim(ringing.cid, SystemClock.elapsedRealtime())
+            systemRings.ringing(ringing.cid)
+            if (show) {
+                client?.onRingingCall(StreamCallId(ringing.type, ringing.id), callerName, emptyMap())
+            }
+            ringName = ringing.cid to callerName
+            CallIntentActivity.ringShown(ringing.cid, callerName)
             emit("incoming", JSONObject().put("call_cid", ringing.cid)
-                .put("caller_id", by?.id ?: "").put("caller_name", by?.userNameOrId ?: ""))
-        } else if (o.value == "busy") {
+                .put("caller_id", callerId).put("caller_name", callerName))
+        } else if (o.value != "duplicate") {
+            // Not this page's call, so its ring ends here and the same cid rings again next time.
+            systemRings.release(ringing.cid)
             // One live call: the second ring is declined as busy, the way Stream reports it.
-            scope.launch { ringing.reject() }
+            if (o.value == "busy") scope.launch { ringing.reject() }
         }
     }
 
     private fun activeChanged(active: Call?) {
         val l = ledger.live() ?: return
-        // The joined call is no longer Stream's active call: hung up in the system UI or left by the
-        // SDK ("local", as on iOS; a remote end arrives as a ringing-state or connection change).
-        if (l.state() == StreamCallLedger.JOINED && active?.cid != l.cid) endedFromSdk(l, "local")
+        // The joined call is no longer Stream's active call. Ended by the other side (Stream's
+        // call.ended sets endedAt before the SDK leaves): "remote"; hung up in the system UI or left by
+        // the SDK: "local". Both as on iOS.
+        if (l.state() != StreamCallLedger.JOINED || active?.cid == l.cid) return
+        val remote = call?.takeIf { it.cid == l.cid }?.state?.endedAt?.value != null
+        endedFromSdk(l, if (remote) "remote" else "local")
     }
 
     private fun bind(c: Call) {
         unbind()
         call = c
+        // Stream hands a call's subscriptions each event before it updates that call's state.
+        rejections = c.subscribeFor(CallRejectedEvent::class.java) { e ->
+            val r = e as? CallRejectedEvent
+            if (r?.user?.id == credentials?.userId) {
+                if (r?.reason == "timeout") timedOutRing = c.cid else declinedRing = c.cid
+            }
+        }
+        // Stream sends the callee call.missed when a ring ends unanswered (Ring Calls docs).
+        missedEvents = c.subscribeFor(CallMissedEvent::class.java) { missedRing = c.cid }
+        // Accepted by this user while it still rings here: accepted on another device or session.
+        accepts = c.subscribeFor(CallAcceptedEvent::class.java) { e ->
+            val a = e as? CallAcceptedEvent
+            val now = ledger.live()
+            if (a?.user?.id == credentials?.userId && now != null && now.cid == c.cid && now.incoming &&
+                now.state() == StreamCallLedger.RINGING) acceptedElsewhere = c.cid
+        }
+        // A member's rejection of this user's outgoing ring, told with who rejected, as on iOS.
+        memberRejections = c.subscribeFor(CallRejectedEvent::class.java) { e ->
+            val r = e as? CallRejectedEvent
+            if (r != null && r.user.id != credentials?.userId) scope.launch { memberRejected(c, r) }
+        }
         val l = ledger.live() ?: return
         callWatchers = mutableListOf(
             scope.launch {
@@ -712,7 +869,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
                     val now = ledger.live() ?: return@collect
                     if (now.epoch != l.epoch) return@collect
                     when (rs) {
-                        is RingingState.RejectedByAll -> endedFromSdk(now, if (now.incoming) "declined" else "rejected")
+                        is RingingState.RejectedByAll -> endedFromSdk(now, if (now.incoming) incomingEnd(c) else "rejected")
                         is RingingState.TimeoutNoAnswer -> endedFromSdk(now, "missed")
                         else -> Unit
                     }
@@ -723,6 +880,13 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
                     val now = ledger.live() ?: return@collect
                     if (now.epoch != l.epoch) return@collect
                     if (conn is RealtimeConnection.Failed || conn is RealtimeConnection.ReconnectingFailed) endedFromSdk(now, "failed")
+                    else if (conn is RealtimeConnection.Disconnected && now.incoming && now.state() == StreamCallLedger.RINGING) {
+                        // Stream left the ringing call (its leave sets Disconnected): a ringing-state end
+                        // dispatched with that leave decides first, else the ring ends here.
+                        yield()
+                        val still = ledger.live()
+                        if (still != null && still.epoch == l.epoch && still.state() == StreamCallLedger.RINGING) endedFromSdk(still, incomingEnd(c))
+                    }
                 }
             },
             scope.launch {
@@ -734,13 +898,57 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         )
     }
 
+    /** Why Stream ended an incoming ring, the same names as on iOS. "declined": this user rejected it
+     *  during this ring, here or on another device. Every other end of a ring nobody here answered is
+     *  "missed", the event Stream itself sends the callee (call.missed, over its connection or by push):
+     *  the caller hung up or rejected it, or the ring timed out. */
+    private fun incomingEnd(c: Call): String = when {
+        acceptedElsewhere == c.cid -> "answered_elsewhere"
+        missedPush == c.cid || timedOutRing == c.cid || missedRing == c.cid -> "missed"
+        declinedRing == c.cid || declinedHere(c) -> "declined"
+        else -> "missed"
+    }
+
+    /** A member rejected this user's outgoing call (joined as soon as it rings): the page is told who
+     *  rejected and Stream's reason. Once every member but this user has rejected (the event's
+     *  session.rejectedBy), the call ends as "rejected". The same name, shape and rule as on iOS. */
+    private fun memberRejected(c: Call, r: CallRejectedEvent) {
+        val l = ledger.live() ?: return
+        if (l.cid != c.cid || l.incoming) return
+        val data = JSONObject().put("code", "rejected").put("message", "a member declined the call")
+            .put("call_cid", l.cid).put("user_id", r.user.id)
+        if (!r.reason.isNullOrEmpty()) data.put("reason", r.reason)
+        emit("error", data)
+        val members = c.state.members.value.map { it.user.id }.toSet() - setOfNotNull(credentials?.userId)
+        val rejected = r.call.session?.rejectedBy?.keys ?: emptySet()
+        if (members.isNotEmpty() && rejected.containsAll(members)) {
+            endSdkCall(l)
+            endedFromSdk(l, "rejected")
+        }
+    }
+
+    /** Stream's system-UI decline set a new rejectActionBundle on this call during its ring. */
+    private fun declinedHere(c: Call): Boolean {
+        val start = ringBundle ?: return false
+        return start.first == c.cid && c.state.rejectActionBundle.value !== start.second
+    }
+
     private fun unbind() {
+        rejections?.dispose()
+        rejections = null
+        missedEvents?.dispose()
+        missedEvents = null
+        memberRejections?.dispose()
+        memberRejections = null
+        accepts?.dispose()
+        accepts = null
         callWatchers.forEach { it.cancel() }
         callWatchers = mutableListOf()
         call = null
     }
 
     private fun endedFromSdk(l: StreamCallLedger.Live, reason: String) {
+        systemRings.release(l.cid)
         if (!ledger.ended(l.cid, l.epoch, reason).isOk) return
         unbind()
         emit("ended", JSONObject().put("call_cid", l.cid).put("reason", reason))
@@ -762,5 +970,6 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     private companion object {
         const val NO_TOKEN = ""
+        const val RING_WAIT_MS = 60_000L
     }
 }
