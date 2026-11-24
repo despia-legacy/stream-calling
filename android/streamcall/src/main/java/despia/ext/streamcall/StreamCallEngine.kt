@@ -35,6 +35,7 @@ import io.getstream.video.android.model.User
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -106,6 +107,8 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private val systemRings = StreamCallRules.SystemRings()
     /** The cid of Stream's ringing call as last seen, so a ring that stops is released. */
     private var streamRinging: String? = null
+    /** Waits for Stream's ringing call to report its ringing state; replaced on every change. */
+    private var pendingRing: Job? = null
 
     fun interface CommandState { fun isActive(): Boolean }
 
@@ -198,6 +201,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     private fun attach(c: StreamVideo, session: TokenSession) {
         watchers.forEach { it.cancel() }
+        pendingRing?.cancel()
         watchers = mutableListOf(
             scope.launch { c.state.ringingCall.collect { ringing -> if (activeSession === session) ringingChanged(ringing) } },
             scope.launch { c.state.activeCall.collect { active -> if (activeSession === session) activeChanged(active) } },
@@ -691,12 +695,24 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private fun ringingChanged(ringing: Call?) {
         // Stream stopped ringing a call this page does not hold (declined elsewhere, missed, or a ring
         // for a call already over): its system ring is gone, so the same cid rings again next time.
+        pendingRing?.cancel()
+        pendingRing = null
         val before = streamRinging
         streamRinging = ringing?.cid
         if (before != null && before != streamRinging && before != ledger.live()?.cid) systemRings.release(before)
         if (ringing == null) return
-        val state = ringing.state.ringingState.value
-        if (state !is RingingState.Incoming) return
+        // Stream sets ringingCall on call.ring before that call has handled the event, so its ringing
+        // state can still be Idle here (ClientState.handleEvent, then CallState.updateRingingState,
+        // 1.35.0). The ring is taken when the state leaves Idle, if it is Incoming and the call is
+        // still Stream's ringing call in the same session; an outgoing ring (ours) is left alone.
+        val session = activeSession
+        pendingRing = scope.launch {
+            val state = ringing.state.ringingState.first { it !is RingingState.Idle }
+            if (state is RingingState.Incoming && streamRinging == ringing.cid && activeSession === session) incomingRing(ringing)
+        }
+    }
+
+    private fun incomingRing(ringing: Call) {
         val o = ledger.incoming(ringing.cid)
         if (o.isOk) {
             bind(ringing)

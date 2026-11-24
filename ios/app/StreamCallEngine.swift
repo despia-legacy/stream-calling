@@ -395,7 +395,9 @@ final class StreamCallEngine {
         switch tracked {
         case .ok:
             guard let l = ledger.live, l.cid == push.cid else { return }
-            if error != nil {
+            if let error = error as NSError? {
+                // CXErrorCodeIncomingCallError (filtered by Do Not Disturb or the block list, unentitled, ...).
+                log("CallKit did not report the incoming call: \(error.domain) \(error.code)")
                 endedFromSDK(l, reason: "failed")
                 return
             }
