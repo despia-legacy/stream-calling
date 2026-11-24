@@ -99,6 +99,14 @@ public final class StreamCallRules {
         public static final long HANDOFF_MS = 30_000L;
         private final Map<String, Long> handedOff = new HashMap<>();
         private final Set<String> ringing = new HashSet<>();
+        private Listener listener;
+
+        /** Told, outside the lock, each cid whose ring is over. */
+        public interface Listener { void ringOver(String cid); }
+
+        public synchronized void listen(Listener l) {
+            listener = l;
+        }
 
         /** True: show cid's system ring now (it is recorded as handed to Stream); false: it already shows. */
         public synchronized boolean claim(String cid, long nowMs) {
@@ -117,10 +125,23 @@ public final class StreamCallRules {
             ringing.add(cid);
         }
 
-        /** cid's ring is over; the next ring for it is shown. */
-        public synchronized void release(String cid) {
-            handedOff.remove(cid);
-            ringing.remove(cid);
+        /** Whether cid's system ring shows now: Stream rings it, or its push hand-off still counts. */
+        public synchronized boolean showing(String cid, long nowMs) {
+            if (cid == null) return false;
+            if (ringing.contains(cid)) return true;
+            Long at = handedOff.get(cid);
+            return at != null && nowMs >= at && nowMs < at + HANDOFF_MS;
+        }
+
+        /** cid's ring is over; the next ring for it is shown, and the listener is told. */
+        public void release(String cid) {
+            Listener l;
+            synchronized (this) {
+                handedOff.remove(cid);
+                ringing.remove(cid);
+                l = listener;
+            }
+            if (l != null && cid != null) l.ringOver(cid);
         }
     }
 

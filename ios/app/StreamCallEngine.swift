@@ -469,6 +469,8 @@ final class StreamCallEngine {
                 _ = try await sdkCall.join(create: create, options: options, ring: ring)
                 self.joinFinished(l, sdkCall)
             } catch {
+                let e = error as NSError
+                self.log("join \(cid) failed: \(e.domain) \(e.code) \(e.localizedDescription)")
                 self.endedFromSDK(l, reason: "failed")
             }
         }
@@ -581,13 +583,13 @@ final class StreamCallEngine {
         guard let l = ledger.live else { return }
         switch event {
         case .typeCallEndedEvent(let e) where e.callCid == l.cid:
-            endedFromSDK(l, reason: l.state == .ringing && l.incoming ? "cancelled" : "remote")
+            endedFromSDK(l, reason: l.state == .ringing && l.incoming ? "missed" : "remote")
         case .typeCallAcceptedEvent(let e) where e.callCid == l.cid && l.incoming && l.state == .ringing
             && e.user.id == credentials?.userId:
             endedFromSDK(l, reason: "answered_elsewhere")
         case .typeCallRejectedEvent(let e) where e.callCid == l.cid:
             if l.incoming, l.state == .ringing {
-                endedFromSDK(l, reason: e.user.id == credentials?.userId ? "declined" : "cancelled")
+                endedFromSDK(l, reason: e.user.id == credentials?.userId ? "declined" : "missed")
             } else if !l.incoming, l.state != .joined {
                 // Ringing an outgoing call: every rejection is a member's; the caller stays until
                 // the SDK ends the call or the page leaves.

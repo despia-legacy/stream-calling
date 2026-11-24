@@ -103,6 +103,10 @@ public final class StreamCallExtension implements NativeExtension, StreamCallEng
         return engine.callerNameOf(intent);
     }
 
+    boolean isRinging(String cid) {
+        return engine.isRinging(cid);
+    }
+
     void answer(String cid) {
         engine.answer(cid);
     }
