@@ -94,6 +94,11 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         val waiters = mutableMapOf<String, CompletableDeferred<String?>>()
     }
     private var activeSession: TokenSession? = null
+    /** The last ring push Stream sent (cid, created_by_id, created_by_display_name): a push ring's call
+     *  has no creator loaded when it rings, so the page's caller comes from the push, as on iOS. */
+    private var pushCaller: Triple<String, String, String>? = null
+    /** The cid of Stream's last missed-call push: Stream ends that ring as rejected by this user. */
+    private var missedPush: String? = null
     private var candidateSession: TokenSession? = null
     private var candidateClient: StreamVideo? = null
     private var configuration = 0L
@@ -553,6 +558,10 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
         if (client == null) return false
         // A ring this app already showed from Stream's connection is not shown twice.
         val cid = extras.getString("call_cid")
+        if (cid != null && extras.getString("type") == "call.ring") {
+            pushCaller = Triple(cid, extras.getString("created_by_id") ?: "", extras.getString("created_by_display_name") ?: "")
+        }
+        if (cid != null && extras.getString("type") == "call.missed") missedPush = cid
         if (extras.getString("type") == "call.ring" && cid != null && !systemRings.claim(cid, SystemClock.elapsedRealtime())) return true
         return FirebaseMessagingDelegate.handleRemoteMessage(RemoteMessage(extras))
     }
@@ -716,17 +725,21 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
     private fun incomingRing(ringing: Call) {
         val o = ledger.incoming(ringing.cid)
         if (o.isOk) {
+            if (missedPush == ringing.cid) missedPush = null
             bind(ringing)
             val by = ringing.state.createdBy.value
+            val pushed = pushCaller?.takeIf { it.first == ringing.cid }
+            val callerId = by?.id ?: pushed?.second ?: ""
+            val callerName = by?.userNameOrId ?: pushed?.third?.ifEmpty { null } ?: callerId
             // Rung over Stream's connection (app running): Stream shows no system ring for that by
             // itself, so it is shown through Stream's own push path, exactly as for an FCM ring.
             val show = systemRings.claim(ringing.cid, SystemClock.elapsedRealtime())
             systemRings.ringing(ringing.cid)
             if (show) {
-                client?.onRingingCall(StreamCallId(ringing.type, ringing.id), by?.userNameOrId ?: "", emptyMap())
+                client?.onRingingCall(StreamCallId(ringing.type, ringing.id), callerName, emptyMap())
             }
             emit("incoming", JSONObject().put("call_cid", ringing.cid)
-                .put("caller_id", by?.id ?: "").put("caller_name", by?.userNameOrId ?: ""))
+                .put("caller_id", callerId).put("caller_name", callerName))
         } else if (o.value != "duplicate") {
             // Not this page's call, so its ring ends here and the same cid rings again next time.
             systemRings.release(ringing.cid)
@@ -737,9 +750,12 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
 
     private fun activeChanged(active: Call?) {
         val l = ledger.live() ?: return
-        // The joined call is no longer Stream's active call: hung up in the system UI or left by the
-        // SDK ("local", as on iOS; a remote end arrives as a ringing-state or connection change).
-        if (l.state() == StreamCallLedger.JOINED && active?.cid != l.cid) endedFromSdk(l, "local")
+        // The joined call is no longer Stream's active call. Ended by the other side (Stream's
+        // call.ended sets endedAt before the SDK leaves): "remote"; hung up in the system UI or left by
+        // the SDK: "local". Both as on iOS.
+        if (l.state() != StreamCallLedger.JOINED || active?.cid == l.cid) return
+        val remote = call?.takeIf { it.cid == l.cid }?.state?.endedAt?.value != null
+        endedFromSdk(l, if (remote) "remote" else "local")
     }
 
     private fun bind(c: Call) {
@@ -752,7 +768,7 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
                     val now = ledger.live() ?: return@collect
                     if (now.epoch != l.epoch) return@collect
                     when (rs) {
-                        is RingingState.RejectedByAll -> endedFromSdk(now, if (now.incoming) "declined" else "rejected")
+                        is RingingState.RejectedByAll -> endedFromSdk(now, if (now.incoming) incomingEnd(c) else "rejected")
                         is RingingState.TimeoutNoAnswer -> endedFromSdk(now, "missed")
                         else -> Unit
                     }
@@ -772,6 +788,14 @@ class StreamCallEngine(private val app: Application, private val host: Host) {
                 }
             },
         )
+    }
+
+    /** Why Stream ended an incoming ring, as on iOS: Stream's missed push, this user's own rejection
+     *  (here or on another device), else the caller (rejected or ended the call while it rang). */
+    private fun incomingEnd(c: Call): String = when {
+        missedPush == c.cid -> "missed"
+        credentials?.userId in c.state.rejectedBy.value -> "declined"
+        else -> "cancelled"
     }
 
     private fun unbind() {
